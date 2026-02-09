@@ -1,0 +1,26 @@
+# Vivado project files (regenerated from TCL scripts)
+vivado/mandelbrot/
+vivado/lcd_test/
+vivado/.Xil/
+
+# Vivado logs and journals
+vivado/*.log
+vivado/*.jou
+vivado/*.backup.*
+
+# Simulation build artifacts
+*.vcd
+*.vvp
+__pycache__/
+
+# Temporary files
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude session files
+.claude/
