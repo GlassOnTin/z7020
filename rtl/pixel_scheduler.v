@@ -78,7 +78,17 @@ module pixel_scheduler #(
     reg signed [WIDTH-1:0] row_c_re_start;  // Start of current row
 
     // =========================================================
-    // Neuron assignment — find first ready neuron
+    // Result pending buffer
+    // =========================================================
+    // Neuron result_valid is a one-cycle pulse. With N neurons,
+    // multiple can fire on the same cycle. We capture ALL pulses
+    // into pending flags and drain one per cycle to the framebuffer.
+    // To prevent buffer overwrite, we don't assign new work to
+    // neurons that still have a pending (uncollected) result.
+    reg [N_NEURONS-1:0] result_pending;
+
+    // =========================================================
+    // Neuron assignment — find first ready neuron (without pending result)
     // =========================================================
     reg [$clog2(N_NEURONS)-1:0] assign_neuron;
     reg                         found_ready;
@@ -88,7 +98,7 @@ module pixel_scheduler #(
         found_ready   = 0;
         assign_neuron = 0;
         for (k = 0; k < N_NEURONS; k = k + 1) begin
-            if (neuron_ready[k] && !found_ready) begin
+            if (neuron_ready[k] && !result_pending[k] && !result_valid[k] && !found_ready) begin
                 assign_neuron = k;
                 found_ready   = 1;
             end
@@ -96,19 +106,19 @@ module pixel_scheduler #(
     end
 
     // =========================================================
-    // Result collection — find first valid result
+    // Result drain — find first pending result
     // =========================================================
-    reg [$clog2(N_NEURONS)-1:0] result_neuron;
-    reg                         found_result;
+    reg [$clog2(N_NEURONS)-1:0] drain_neuron;
+    reg                         found_pending;
 
     integer m;
     always @(*) begin
-        found_result  = 0;
-        result_neuron = 0;
+        found_pending = 0;
+        drain_neuron  = 0;
         for (m = 0; m < N_NEURONS; m = m + 1) begin
-            if (result_valid[m] && !found_result) begin
-                result_neuron = m;
-                found_result  = 1;
+            if (result_pending[m] && !found_pending) begin
+                drain_neuron  = m;
+                found_pending = 1;
             end
         end
     end
@@ -116,6 +126,7 @@ module pixel_scheduler #(
     // =========================================================
     // Main logic
     // =========================================================
+    integer n;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             frame_busy     <= 0;
@@ -135,24 +146,38 @@ module pixel_scheduler #(
             fb_wr_en       <= 0;
             fb_wr_addr     <= 0;
             fb_wr_data     <= 0;
+            result_pending <= 0;
         end else begin
             // Defaults
             neuron_valid <= 0;
             fb_wr_en     <= 0;
             frame_done   <= 0;
 
-            // ---- Result collection (always active during frame) ----
-            if (frame_busy && found_result) begin
-                fb_wr_en   <= 1;
-                fb_wr_addr <= result_pixel_id[result_neuron*16 +: 16];
-                fb_wr_data <= result_iter[result_neuron*ITER_W +: ITER_W];
-                pixels_done <= pixels_done + 1;
+            // ---- Capture result pulses into pending buffer ----
+            // All neurons captured simultaneously — no lost results
+            for (n = 0; n < N_NEURONS; n = n + 1) begin
+                if (result_valid[n])
+                    result_pending[n] <= 1'b1;
+            end
 
-                // Check if frame is complete
-                if (pixels_done + 1 == PIX_COUNT) begin
-                    frame_busy <= 0;
-                    frame_done <= 1;
-                end
+            // ---- Drain one pending result per cycle ----
+            if (frame_busy && found_pending) begin
+                fb_wr_en   <= 1;
+                fb_wr_addr <= result_pixel_id[drain_neuron*16 +: 16];
+                fb_wr_data <= result_iter[drain_neuron*ITER_W +: ITER_W];
+                result_pending[drain_neuron] <= 1'b0;
+                pixels_done <= pixels_done + 1;
+            end
+
+            // ---- Frame completion (state-based) ----
+            // Done when all pixels assigned, all neurons idle, no pending/active results.
+            // This avoids relying on exact pixel counting.
+            if (frame_busy && all_assigned &&
+                (neuron_ready == {N_NEURONS{1'b1}}) &&
+                (result_pending == {N_NEURONS{1'b0}}) &&
+                (result_valid == {N_NEURONS{1'b0}})) begin
+                frame_busy <= 0;
+                frame_done <= 1;
             end
 
             // ---- Pixel assignment ----
@@ -194,6 +219,7 @@ module pixel_scheduler #(
                 cur_c_re       <= c_re_start;
                 cur_c_im       <= c_im_start;
                 row_c_re_start <= c_re_start;
+                result_pending <= 0;
             end
         end
     end

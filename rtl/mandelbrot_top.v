@@ -91,7 +91,7 @@ module mandelbrot_top #(
     wire signed [WIDTH-1:0]  neuron_c_re_w;
     wire signed [WIDTH-1:0]  neuron_c_im_w;
     wire [15:0]              neuron_pixel_id_w;
-    wire [ITER_W-1:0]        max_iter_w = DEFAULT_MAX_ITER;
+    reg  [ITER_W-1:0]        max_iter_w;
 
     // Neuron results — flat buses for Verilog-2001 compatibility
     wire [N_NEURONS-1:0]         result_valid_w;
@@ -114,6 +114,12 @@ module mandelbrot_top #(
 
     // Display frame done
     wire                     disp_frame_done;
+
+    // Auto-zoom viewport registers (declared here, driven by zoom controller below)
+    reg signed [WIDTH-1:0] zoom_step;
+    reg signed [WIDTH-1:0] zoom_cre_start;
+    reg signed [WIDTH-1:0] zoom_cim_start;
+    reg startup;
 
     // =========================================================
     // Neuron pool
@@ -152,10 +158,10 @@ module mandelbrot_top #(
         .frame_start    (frame_start_r),
         .frame_busy     (frame_busy_w),
         .frame_done     (frame_done_w),
-        .c_re_start     (DEFAULT_CRE_START),
-        .c_im_start     (DEFAULT_CIM_START),
-        .c_re_step      (DEFAULT_CRE_STEP),
-        .c_im_step      (DEFAULT_CIM_STEP),
+        .c_re_start     (zoom_cre_start),
+        .c_im_start     (zoom_cim_start),
+        .c_re_step      (zoom_step),
+        .c_im_step      (zoom_step),
         .max_iter       (max_iter_w),
         .neuron_valid   (neuron_valid_w),
         .neuron_ready   (neuron_ready_w),
@@ -237,7 +243,7 @@ module mandelbrot_top #(
     // =========================================================
     sp2_spi_driver #(
         .H_RES(H_RES), .V_RES(V_RES),
-        .SCK_DIV(24)    // ~1 MHz SCK for testing (change to 0 for 25 MHz)
+        .SCK_DIV(0)     // 25 MHz SCK (max speed)
     ) u_display (
         .clk        (clk),
         .rst_n      (rst_n),
@@ -259,17 +265,30 @@ module mandelbrot_top #(
     end
 
     // =========================================================
-    // Frame control — auto-start
+    // Auto-zoom controller
     // =========================================================
-    // For Phase 1-2: automatically start a new frame after display completes
-    reg frame_done_seen;
-    reg startup;
+    // Zoom target: seahorse valley (-0.745, +0.113)
+    localparam signed [WIDTH-1:0] TARGET_RE = 32'shF414_7AE1;  // -0.745 in Q4.28
+    localparam signed [WIDTH-1:0] TARGET_IM = 32'sh01CF_DF3B;  // +0.113 in Q4.28
+
+    // Next step value after zoom
+    wire signed [WIDTH-1:0] next_step = zoom_step - (zoom_step >>> 6);  // × 63/64 ≈ 0.984
+
+    // Compute viewport start from next_step:
+    //   start_re = TARGET_RE - 160 * next_step   (160 = 128 + 32)
+    //   start_im = TARGET_IM -  86 * next_step   ( 86 =  64 + 16 + 4 + 2)
+    wire signed [WIDTH-1:0] half_h = (next_step <<< 7) + (next_step <<< 5);          // 160 * step
+    wire signed [WIDTH-1:0] half_v = (next_step <<< 6) + (next_step <<< 4)
+                                   + (next_step <<< 2) + (next_step <<< 1);          //  86 * step
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             frame_start_r  <= 0;
-            frame_done_seen <= 0;
             startup        <= 1;
+            zoom_step      <= DEFAULT_CRE_STEP;
+            zoom_cre_start <= DEFAULT_CRE_START;
+            zoom_cim_start <= DEFAULT_CIM_START;
+            max_iter_w     <= DEFAULT_MAX_ITER;
         end else begin
             frame_start_r <= 0;
 
@@ -279,24 +298,31 @@ module mandelbrot_top #(
                 startup       <= 0;
             end
 
-            // Auto-restart on frame completion
+            // On compute frame done: zoom in and start next frame
             if (frame_done_w && !frame_busy_w) begin
-                frame_start_r <= 1;
+                // Shrink step by factor 63/64 ≈ 0.984
+                zoom_step      <= next_step;
+                // Recompute viewport origin from new step (consistent with next_step)
+                zoom_cre_start <= TARGET_RE - half_h;
+                zoom_cim_start <= TARGET_IM - half_v;
+                // Ramp up max_iter (more detail as we zoom in)
+                if (max_iter_w < 1024)
+                    max_iter_w <= max_iter_w + 1;
+                frame_start_r  <= 1;
             end
         end
     end
 
     // =========================================================
-    // LED heartbeat — toggle on each frame
+    // LED1 — toggles each compute frame (shows zoom progress)
     // =========================================================
-    reg led_r;
-    assign led_frame = led_r;
-
+    reg led_frame_r;
+    assign led_frame = led_frame_r;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
-            led_r <= 0;
-        else if (disp_frame_done)  // Toggle on DISPLAY frame done (not compute)
-            led_r <= ~led_r;
+            led_frame_r <= 0;
+        else if (frame_done_w)
+            led_frame_r <= ~led_frame_r;
     end
 
     // Backlight pass-through from SPI driver
