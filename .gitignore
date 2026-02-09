@@ -3,6 +3,10 @@ vivado/mandelbrot/
 vivado/lcd_test/
 vivado/.Xil/
 
+# QSPI boot generated files (regenerated from create_fsbl.tcl + bootgen)
+vivado/boot/
+vivado/BOOT.bin
+
 # Vivado logs and journals
 vivado/*.log
 vivado/*.jou
@@ -17,6 +21,12 @@ __pycache__/
 *.swp
 *.swo
 *~
+
+# Root-level Vivado/Xilinx artifacts
+.Xil/
+vivado.jou
+vivado.log
+hailort.log
 
 # OS files
 .DS_Store

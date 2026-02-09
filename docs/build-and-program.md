@@ -196,3 +196,100 @@ vivado -mode batch -source vivado/program.tcl           # Program
 4. **Configuration**: `CFGBVS VCCO`, `CONFIG_VOLTAGE 3.3`
 
 The timing constraint is straightforward — at 50 MHz (20 ns period), the design has substantial margin. All paths meet timing comfortably.
+
+## QSPI Flash Boot (Persistent)
+
+JTAG programming is volatile — the design is lost on power-off. To make the Mandelbrot explorer start automatically at power-on, write the bitstream to the board's QSPI flash.
+
+The board has a BOOT jumper with three positions: **JTAG**, **QSPI**, and **SD**. For flash boot, the jumper must be set to **QSPI**.
+
+### How Zynq QSPI Boot Works
+
+On a Zynq-7000, the PL (FPGA fabric) cannot load directly from flash. Instead, the PS (ARM core) boots first:
+
+```
+  Power-on → PS BootROM → loads FSBL from QSPI → FSBL configures PL → design runs
+```
+
+1. **BootROM**: Hardwired in silicon, reads the boot image header from QSPI flash
+2. **FSBL** (First Stage Boot Loader): Minimal ARM program that initializes the PS clocks, reads the bitstream from flash, and configures the PL
+3. **PL configuration**: The FSBL writes the bitstream into the PL via the PCAP interface
+
+Even though our design is PL-only (no ARM software), we need the FSBL as a bootstrap mechanism. The FSBL runs, loads the bitstream, and then the ARM idles while the PL runs the Mandelbrot explorer.
+
+### Prerequisites
+
+```bash
+# On the build machine (msi-z790):
+sudo apt install gcc-arm-none-eabi      # ARM cross-compiler for FSBL
+source ~/Code/z7020/env.sh              # Vivado in PATH
+```
+
+### Step 1: Generate FSBL (One-Time)
+
+```bash
+vivado -mode batch -source vivado/create_fsbl.tcl > vivado/boot/create_fsbl.log 2>&1
+```
+
+This creates a minimal PS7 block design with QSPI enabled, exports a hardware platform (XSA), and compiles the Zynq FSBL using `xsdb` + `arm-none-eabi-gcc`. The output is:
+
+```
+vivado/boot/fsbl/executable.elf
+```
+
+This FSBL only needs to be regenerated if the PS7 configuration changes (which it won't for PL-only designs).
+
+### Step 2: Build Bitstream
+
+If not already done:
+
+```bash
+vivado -mode batch -source vivado/run_all.tcl > vivado/build.log 2>&1
+```
+
+### Step 3: Create BOOT.bin and Program Flash
+
+```bash
+./vivado/program_qspi.sh
+```
+
+This script:
+1. Runs `bootgen` to package the FSBL + bitstream into `vivado/BOOT.bin`
+2. Programs the QSPI flash via JTAG (erase + write + verify, ~60 seconds)
+
+The boot image format is defined in `vivado/boot.bif`:
+
+```
+the_ROM_image:
+{
+    [bootloader] boot/fsbl/executable.elf
+    mandelbrot/mandelbrot.runs/impl_1/mandelbrot_top.bit
+}
+```
+
+### Step 4: Set Boot Mode
+
+Move the **BOOT** jumper from JTAG to **QSPI** and power-cycle the board. The Mandelbrot explorer starts automatically within ~1 second.
+
+### Re-Flashing After Design Changes
+
+After modifying the RTL and rebuilding the bitstream, you only need to repeat steps 2 and 3 — the FSBL doesn't change:
+
+```bash
+vivado -mode batch -source vivado/run_all.tcl > vivado/build.log 2>&1
+./vivado/program_qspi.sh
+```
+
+### Flash Part Compatibility
+
+The `flash.tcl` script defaults to `s25fl128sxxxxxx0-spi-x1_x2_x4` (Spansion 128Mbit) and automatically tries common alternatives (Micron N25Q128, ISSI IS25LP128, Winbond W25Q128). If your board uses a different flash chip, check the marking on the IC and update the `flash_part` variable in `vivado/flash.tcl`.
+
+### Troubleshooting
+
+**"FSBL not found"**: Run `vivado -mode batch -source vivado/create_fsbl.tcl` first.
+
+**Flash programming fails with "no configuration memory"**: The flash part name doesn't match your board's chip. Run `get_cfgmem_parts *spi*` in the Vivado TCL console to list supported parts, then update `flash.tcl`.
+
+**Board doesn't boot from QSPI**: Verify the BOOT jumper is in the QSPI position (not JTAG or SD). Check that the BOOT.bin was verified successfully during programming.
+
+**"arm-none-eabi-gcc not found"**: Install the ARM bare-metal toolchain: `sudo apt install gcc-arm-none-eabi`.

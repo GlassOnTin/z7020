@@ -79,6 +79,17 @@ vivado -mode batch -source vivado/program.tcl           # Program FPGA
 
 The display should show the Mandelbrot set and begin auto-zooming into the seahorse valley. LED1 toggles per compute frame; LED2 blinks at 1 Hz as a heartbeat.
 
+### Persistent Flash (QSPI Boot)
+
+To make the design survive power cycles, write it to the QSPI flash:
+
+```bash
+vivado -mode batch -source vivado/create_fsbl.tcl       # One-time: generate FSBL
+./vivado/program_qspi.sh                                # Package + flash BOOT.bin
+```
+
+Then set the BOOT jumper to **QSPI** and power-cycle. See [Build & Program](docs/build-and-program.md#qspi-flash-boot-persistent) for details.
+
 ## Documentation
 
 | Document | Description |
@@ -108,7 +119,11 @@ z7020/
 ├── vivado/
 │   ├── create_project.tcl    # Project creation script
 │   ├── run_all.tcl           # Full build: synth → impl → bitstream
-│   └── program.tcl           # JTAG programming script
+│   ├── program.tcl           # JTAG programming script (volatile)
+│   ├── create_fsbl.tcl       # Generate FSBL for QSPI boot (one-time)
+│   ├── boot.bif              # Boot image format descriptor
+│   ├── flash.tcl             # QSPI flash programming via hardware manager
+│   └── program_qspi.sh      # All-in-one: bootgen + flash
 ├── sim/
 │   ├── tb_neuron_core.v      # Neuron core testbench
 │   ├── tb_fixed_mul.v        # Fixed-point multiplier testbench
