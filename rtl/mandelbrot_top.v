@@ -300,14 +300,22 @@ module mandelbrot_top #(
 
             // On compute frame done: zoom in and start next frame
             if (frame_done_w && !frame_busy_w) begin
-                // Shrink step by factor 63/64 ≈ 0.984
-                zoom_step      <= next_step;
-                // Recompute viewport origin from new step (consistent with next_step)
-                zoom_cre_start <= TARGET_RE - half_h;
-                zoom_cim_start <= TARGET_IM - half_v;
-                // Ramp up max_iter (more detail as we zoom in)
-                if (max_iter_w < 1024)
-                    max_iter_w <= max_iter_w + 1;
+                if (next_step == zoom_step) begin
+                    // Precision exhausted (step >>> 6 rounds to 0) — loop back
+                    zoom_step      <= DEFAULT_CRE_STEP;
+                    zoom_cre_start <= DEFAULT_CRE_START;
+                    zoom_cim_start <= DEFAULT_CIM_START;
+                    max_iter_w     <= DEFAULT_MAX_ITER;
+                end else begin
+                    // Shrink step by factor 63/64 ≈ 0.984
+                    zoom_step      <= next_step;
+                    // Recompute viewport origin from new step
+                    zoom_cre_start <= TARGET_RE - half_h;
+                    zoom_cim_start <= TARGET_IM - half_v;
+                    // Ramp up max_iter (more detail as we zoom in)
+                    if (max_iter_w < 1024)
+                        max_iter_w <= max_iter_w + 1;
+                end
                 frame_start_r  <= 1;
             end
         end
