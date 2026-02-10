@@ -32,8 +32,15 @@ create_bd_design "system"
 # Add Zynq PS7 IP
 create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 ps7_0
 
-# Configure for QSPI boot with minimal peripherals
+# Configure PS7 for this board (Hello-FPGA Smart ZYNQ SP)
+# From core board schematic:
+#   PS clock: 50 MHz (Y2 oscillator — verify with schematic)
+#   DDR3L: 2x NT5CC256M16EP-DI (4Gbit each, 32-bit bus, 1.35V)
+#          Pin-compatible with Micron MT41K256M16 RE-125
+#   MIO bank 0: 3.3V, MIO bank 1: 1.8V
+#   QSPI: W25Q256 on MIO 1-6
 set_property -dict [list \
+    CONFIG.PCW_CRYSTAL_PERIPHERAL_FREQMHZ {50} \
     CONFIG.PCW_QSPI_PERIPHERAL_ENABLE {1} \
     CONFIG.PCW_QSPI_GRP_SINGLE_SS_ENABLE {1} \
     CONFIG.PCW_USE_M_AXI_GP0 {0} \
@@ -44,6 +51,24 @@ set_property -dict [list \
     CONFIG.PCW_USB0_PERIPHERAL_ENABLE {0} \
     CONFIG.PCW_TTC0_PERIPHERAL_ENABLE {0} \
     CONFIG.PCW_GPIO_MIO_GPIO_ENABLE {0} \
+    CONFIG.PCW_PRESET_BANK0_VOLTAGE {LVCMOS 3.3V} \
+    CONFIG.PCW_PRESET_BANK1_VOLTAGE {LVCMOS 1.8V} \
+    CONFIG.PCW_UIPARAM_DDR_MEMORY_TYPE {DDR 3 (Low Voltage)} \
+    CONFIG.PCW_UIPARAM_DDR_PARTNO {MT41K256M16 RE-125} \
+    CONFIG.PCW_UIPARAM_DDR_BUS_WIDTH {16 Bit} \
+    CONFIG.PCW_UIPARAM_DDR_ENABLE {1} \
+    CONFIG.PCW_UIPARAM_DDR_TRAIN_DATA_EYE {1} \
+    CONFIG.PCW_UIPARAM_DDR_TRAIN_READ_GATE {1} \
+    CONFIG.PCW_UIPARAM_DDR_TRAIN_WRITE_LEVEL {1} \
+    CONFIG.PCW_UIPARAM_DDR_ECC {Disabled} \
+    CONFIG.PCW_UIPARAM_DDR_DQS_TO_CLK_DELAY_0 {-0.073} \
+    CONFIG.PCW_UIPARAM_DDR_DQS_TO_CLK_DELAY_1 {-0.034} \
+    CONFIG.PCW_UIPARAM_DDR_DQS_TO_CLK_DELAY_2 {-0.03} \
+    CONFIG.PCW_UIPARAM_DDR_DQS_TO_CLK_DELAY_3 {-0.082} \
+    CONFIG.PCW_UIPARAM_DDR_BOARD_DELAY0 {0.176} \
+    CONFIG.PCW_UIPARAM_DDR_BOARD_DELAY1 {0.159} \
+    CONFIG.PCW_UIPARAM_DDR_BOARD_DELAY2 {0.162} \
+    CONFIG.PCW_UIPARAM_DDR_BOARD_DELAY3 {0.187} \
 ] [get_bd_cells ps7_0]
 
 # Apply board automation (connects DDR and fixed I/O)

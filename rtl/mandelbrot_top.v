@@ -20,7 +20,8 @@ module mandelbrot_top #(
     parameter ITER_W    = 16,
     parameter H_RES     = 320,
     parameter V_RES     = 172,
-    parameter PIX_COUNT = H_RES * V_RES
+    parameter PIX_COUNT = H_RES * V_RES,
+    parameter TEST_MODE = 0       // 0=normal, 1=solid color (iter=42), 2=gradient (iter=pixel_id[15:8])
 )(
     input  wire        clk_50m,       // 50 MHz from PL crystal
     input  wire        rst_n_in,      // External reset (active low)
@@ -115,6 +116,15 @@ module mandelbrot_top #(
     // Display frame done
     wire                     disp_frame_done;
 
+    // Double-buffer control
+    reg                      disp_buf_sel;    // 0 = SPI reads A, 1 = SPI reads B
+    reg                      swap_pending;    // Set when sweep done, cleared on swap
+
+    // Color sweep state
+    reg                      sweeping;
+    reg [15:0]               sweep_addr;
+    reg                      sweep_done;
+
     // Auto-zoom viewport registers (declared here, driven by zoom controller below)
     reg signed [WIDTH-1:0] zoom_step;
     reg signed [WIDTH-1:0] zoom_cre_start;
@@ -122,59 +132,115 @@ module mandelbrot_top #(
     reg startup;
 
     // =========================================================
-    // Neuron pool
+    // Neuron pool + Pixel scheduler (or test-mode substitute)
     // =========================================================
-    genvar i;
     generate
-        for (i = 0; i < N_NEURONS; i = i + 1) begin : neurons
-            neuron_core #(
-                .WIDTH(WIDTH), .FRAC(FRAC), .ITER_W(ITER_W)
-            ) u_neuron (
+        if (TEST_MODE == 0) begin : gen_normal
+            // --- Production: neuron pool + scheduler ---
+            genvar i;
+            for (i = 0; i < N_NEURONS; i = i + 1) begin : neurons
+                neuron_core #(
+                    .WIDTH(WIDTH), .FRAC(FRAC), .ITER_W(ITER_W)
+                ) u_neuron (
+                    .clk            (clk),
+                    .rst_n          (rst_n),
+                    .pixel_valid    (neuron_valid_w[i]),
+                    .pixel_ready    (neuron_ready_w[i]),
+                    .c_re           (neuron_c_re_w),
+                    .c_im           (neuron_c_im_w),
+                    .pixel_id       (neuron_pixel_id_w),
+                    .max_iter       (max_iter_w),
+                    .result_valid   (result_valid_w[i]),
+                    .result_pixel_id(result_pixel_id_w[i*16 +: 16]),
+                    .result_iter    (result_iter_w[i*ITER_W +: ITER_W]),
+                    .busy           ()
+                );
+            end
+
+            pixel_scheduler #(
+                .N_NEURONS(N_NEURONS), .WIDTH(WIDTH), .FRAC(FRAC),
+                .ITER_W(ITER_W), .H_RES(H_RES), .V_RES(V_RES)
+            ) u_scheduler (
                 .clk            (clk),
                 .rst_n          (rst_n),
-                .pixel_valid    (neuron_valid_w[i]),
-                .pixel_ready    (neuron_ready_w[i]),
-                .c_re           (neuron_c_re_w),
-                .c_im           (neuron_c_im_w),
-                .pixel_id       (neuron_pixel_id_w),
+                .frame_start    (frame_start_r),
+                .frame_busy     (frame_busy_w),
+                .frame_done     (frame_done_w),
+                .c_re_start     (zoom_cre_start),
+                .c_im_start     (zoom_cim_start),
+                .c_re_step      (zoom_step),
+                .c_im_step      (zoom_step),
                 .max_iter       (max_iter_w),
-                .result_valid   (result_valid_w[i]),
-                .result_pixel_id(result_pixel_id_w[i*16 +: 16]),
-                .result_iter    (result_iter_w[i*ITER_W +: ITER_W]),
-                .busy           ()
+                .neuron_valid   (neuron_valid_w),
+                .neuron_ready   (neuron_ready_w),
+                .neuron_c_re    (neuron_c_re_w),
+                .neuron_c_im    (neuron_c_im_w),
+                .neuron_pixel_id(neuron_pixel_id_w),
+                .result_valid   (result_valid_w),
+                .result_pixel_id(result_pixel_id_w),
+                .result_iter    (result_iter_w),
+                .fb_wr_en       (fb_iter_wr_en),
+                .fb_wr_addr     (fb_iter_wr_addr),
+                .fb_wr_data     (fb_iter_wr_data)
             );
+        end else begin : gen_test
+            // --- Test mode: trivial pixel writer, no neurons/scheduler ---
+            // Writes one pixel per clock after frame_start.
+            // TEST_MODE=1: solid iter=42, TEST_MODE=2: gradient iter=pixel_id[15:8]
+            reg        test_busy;
+            reg        test_done;
+            reg [15:0] test_addr;
+            reg        test_wr_en;
+            reg [ITER_W-1:0] test_data;
+
+            assign frame_busy_w     = test_busy;
+            assign frame_done_w     = test_done;
+            assign fb_iter_wr_en    = test_wr_en;
+            assign fb_iter_wr_addr  = test_addr;
+            assign fb_iter_wr_data  = test_data;
+
+            // Tie off unused neuron wires
+            assign neuron_valid_w     = {N_NEURONS{1'b0}};
+            assign neuron_ready_w     = {N_NEURONS{1'b1}};
+            assign neuron_c_re_w      = {WIDTH{1'b0}};
+            assign neuron_c_im_w      = {WIDTH{1'b0}};
+            assign neuron_pixel_id_w  = 16'd0;
+            assign result_valid_w     = {N_NEURONS{1'b0}};
+            assign result_pixel_id_w  = {(N_NEURONS*16){1'b0}};
+            assign result_iter_w      = {(N_NEURONS*ITER_W){1'b0}};
+
+            always @(posedge clk or negedge rst_n) begin
+                if (!rst_n) begin
+                    test_busy  <= 0;
+                    test_done  <= 0;
+                    test_addr  <= 0;
+                    test_wr_en <= 0;
+                    test_data  <= 0;
+                end else begin
+                    test_done  <= 0;
+                    test_wr_en <= 0;
+
+                    if (frame_start_r && !test_busy) begin
+                        test_busy  <= 1;
+                        test_addr  <= 0;
+                        test_wr_en <= 1;
+                        test_data  <= (TEST_MODE == 1) ? 42 : 0;
+                    end else if (test_busy) begin
+                        if (test_addr == PIX_COUNT[15:0] - 1) begin
+                            test_busy <= 0;
+                            test_done <= 1;
+                        end else begin
+                            test_addr  <= test_addr + 1;
+                            test_wr_en <= 1;
+                            // MODE 1: constant iter=42, MODE 2: low byte of pixel address
+                            test_data  <= (TEST_MODE == 1) ? 42
+                                                           : {8'd0, test_addr[7:0] + 8'd1};
+                        end
+                    end
+                end
+            end
         end
     endgenerate
-
-    // =========================================================
-    // Pixel scheduler
-    // =========================================================
-    pixel_scheduler #(
-        .N_NEURONS(N_NEURONS), .WIDTH(WIDTH), .FRAC(FRAC),
-        .ITER_W(ITER_W), .H_RES(H_RES), .V_RES(V_RES)
-    ) u_scheduler (
-        .clk            (clk),
-        .rst_n          (rst_n),
-        .frame_start    (frame_start_r),
-        .frame_busy     (frame_busy_w),
-        .frame_done     (frame_done_w),
-        .c_re_start     (zoom_cre_start),
-        .c_im_start     (zoom_cim_start),
-        .c_re_step      (zoom_step),
-        .c_im_step      (zoom_step),
-        .max_iter       (max_iter_w),
-        .neuron_valid   (neuron_valid_w),
-        .neuron_ready   (neuron_ready_w),
-        .neuron_c_re    (neuron_c_re_w),
-        .neuron_c_im    (neuron_c_im_w),
-        .neuron_pixel_id(neuron_pixel_id_w),
-        .result_valid   (result_valid_w),
-        .result_pixel_id(result_pixel_id_w),
-        .result_iter    (result_iter_w),
-        .fb_wr_en       (fb_iter_wr_en),
-        .fb_wr_addr     (fb_iter_wr_addr),
-        .fb_wr_data     (fb_iter_wr_data)
-    );
 
     // =========================================================
     // Iteration count framebuffer (BRAM, dual-port)
@@ -191,12 +257,13 @@ module mandelbrot_top #(
             iter_fb[fb_iter_wr_addr] <= fb_iter_wr_data;
     end
 
-    // Port B: read (addressed by display driver, through colormap)
+    // Port B: read (addressed by display driver or sweep)
     reg [ITER_W-1:0] iter_fb_rd;
     reg [15:0]       iter_fb_rd_addr;
 
     always @(posedge clk) begin
-        iter_fb_rd <= iter_fb[iter_fb_rd_addr];
+        iter_fb_rd_addr <= sweeping ? sweep_addr : fb_disp_addr;
+        iter_fb_rd      <= iter_fb[iter_fb_rd_addr];
     end
 
     // =========================================================
@@ -215,27 +282,70 @@ module mandelbrot_top #(
     );
 
     // =========================================================
-    // Display framebuffer (BRAM, dual-port)
-    // Port A: Write from colormap
-    // Port B: Read from SPI driver
+    // Display framebuffer — double-buffered (BRAM, dual-port)
+    // Each buffer has its own always block for clean BRAM inference.
+    // Port A: Write from colormap sweep (to back buffer)
+    // Port B: Read from SPI driver (from front buffer)
     // =========================================================
-    (* ram_style = "block" *) reg [15:0] disp_fb [0:FB_DEPTH-1];
 
-    // Colormap write pipeline: delay address by colormap latency (1 cycle)
+    // Colormap write pipeline: delay address to match iter_fb read + colormap latency (2 cycles)
     reg [15:0] color_wr_addr;
     reg [15:0] color_wr_addr_d;
+
+    // Delay sweeping by 2 cycles to match the address pipeline latency.
+    // Without this, the first 2 writes after sweep start go to stale
+    // display-path addresses instead of sweep addresses.
+    reg        sweep_wr_v0, sweep_wr_v1;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            sweep_wr_v0 <= 0;
+            sweep_wr_v1 <= 0;
+        end else begin
+            sweep_wr_v0 <= sweeping;
+            sweep_wr_v1 <= sweep_wr_v0;
+        end
+    end
+    wire       color_wr_en = color_valid & sweep_wr_v1;
 
     always @(posedge clk) begin
         color_wr_addr   <= iter_fb_rd_addr;
         color_wr_addr_d <= color_wr_addr;
-        if (color_valid)
-            disp_fb[color_wr_addr_d] <= color_rgb565;
     end
 
-    // Port B: read from SPI driver
-    reg [15:0] disp_fb_rd;
+    // Back-buffer write enables (one-hot, never both)
+    wire wr_en_a = color_wr_en &  disp_buf_sel;  // buf_sel=1 → SPI reads B, write to A
+    wire wr_en_b = color_wr_en & ~disp_buf_sel;  // buf_sel=0 → SPI reads A, write to B
+
+    // Buffer A — dedicated write and read ports
+    (* ram_style = "block" *) reg [15:0] disp_fb_a [0:FB_DEPTH-1];
+    reg [15:0] disp_fb_a_rd;
+
     always @(posedge clk) begin
-        disp_fb_rd <= disp_fb[fb_disp_addr];
+        if (wr_en_a)
+            disp_fb_a[color_wr_addr_d] <= color_rgb565;
+    end
+
+    always @(posedge clk) begin
+        disp_fb_a_rd <= disp_fb_a[fb_disp_addr];
+    end
+
+    // Buffer B — dedicated write and read ports
+    (* ram_style = "block" *) reg [15:0] disp_fb_b [0:FB_DEPTH-1];
+    reg [15:0] disp_fb_b_rd;
+
+    always @(posedge clk) begin
+        if (wr_en_b)
+            disp_fb_b[color_wr_addr_d] <= color_rgb565;
+    end
+
+    always @(posedge clk) begin
+        disp_fb_b_rd <= disp_fb_b[fb_disp_addr];
+    end
+
+    // Front-buffer read mux (after BRAM output registers)
+    reg [15:0] disp_fb_rd;
+    always @(*) begin
+        disp_fb_rd = disp_buf_sel ? disp_fb_b_rd : disp_fb_a_rd;
     end
 
     // =========================================================
@@ -258,14 +368,44 @@ module mandelbrot_top #(
         .frame_done (disp_frame_done)
     );
 
-    // Connect display read address to iteration FB read address
-    // (colormap sits between iteration FB and display FB)
-    always @(posedge clk) begin
-        iter_fb_rd_addr <= fb_disp_addr;
+    // iter_fb_rd_addr is now driven by the sweep/display mux in the iter_fb read block above
+
+    // =========================================================
+    // Color sweep state machine
+    // =========================================================
+    // After compute completes, sweep reads iter_fb[0..PIX_COUNT-1]
+    // through the colormap and writes results into the back disp_fb.
+    // Pipeline: cycle N: set sweep_addr → N+1: iter_fb_rd valid →
+    //           N+2: color_rgb565 valid → write to back buffer.
+    // sweep_addr counts 0 to PIX_COUNT-1, then 2 extra flush cycles.
+
+    localparam [15:0] SWEEP_END = PIX_COUNT[15:0] + 16'd1;  // +1 flush (sweep_wr_v1 delay provides 2 extra write cycles)
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            sweeping   <= 0;
+            sweep_addr <= 0;
+            sweep_done <= 0;
+        end else begin
+            sweep_done <= 0;
+
+            if (frame_done_w && !frame_busy_w && !sweeping) begin
+                // Compute done — start sweep
+                sweeping   <= 1;
+                sweep_addr <= 0;
+            end else if (sweeping) begin
+                if (sweep_addr == SWEEP_END - 1) begin
+                    sweeping   <= 0;
+                    sweep_done <= 1;
+                end else begin
+                    sweep_addr <= sweep_addr + 1;
+                end
+            end
+        end
     end
 
     // =========================================================
-    // Auto-zoom controller
+    // Auto-zoom controller with double-buffer swap
     // =========================================================
     // Zoom target: seahorse valley (-0.745, +0.113)
     localparam signed [WIDTH-1:0] TARGET_RE = 32'shF414_7AE1;  // -0.745 in Q4.28
@@ -281,6 +421,11 @@ module mandelbrot_top #(
     wire signed [WIDTH-1:0] half_v = (next_step <<< 6) + (next_step <<< 4)
                                    + (next_step <<< 2) + (next_step <<< 1);          //  86 * step
 
+    // Frame sequencing:
+    //   frame_done_w → sweep iter_fb through colormap into back buffer (~1.1ms)
+    //   sweep_done → set swap_pending
+    //   disp_frame_done && swap_pending → swap buffers + zoom + frame_start
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             frame_start_r  <= 0;
@@ -289,6 +434,8 @@ module mandelbrot_top #(
             zoom_cre_start <= DEFAULT_CRE_START;
             zoom_cim_start <= DEFAULT_CIM_START;
             max_iter_w     <= DEFAULT_MAX_ITER;
+            disp_buf_sel   <= 0;
+            swap_pending   <= 0;
         end else begin
             frame_start_r <= 0;
 
@@ -298,8 +445,15 @@ module mandelbrot_top #(
                 startup       <= 0;
             end
 
-            // On compute frame done: zoom in and start next frame
-            if (frame_done_w && !frame_busy_w) begin
+            // Sweep done → arm buffer swap
+            if (sweep_done)
+                swap_pending <= 1;
+
+            // SPI frame boundary + swap pending → swap buffers and start next compute
+            if (disp_frame_done && swap_pending) begin
+                disp_buf_sel <= ~disp_buf_sel;
+                swap_pending <= 0;
+
                 if (next_step == zoom_step) begin
                     // Precision exhausted (step >>> 6 rounds to 0) — loop back
                     zoom_step      <= DEFAULT_CRE_STEP;
@@ -316,7 +470,7 @@ module mandelbrot_top #(
                     if (max_iter_w < 1024)
                         max_iter_w <= max_iter_w + 1;
                 end
-                frame_start_r  <= 1;
+                frame_start_r <= 1;
             end
         end
     end

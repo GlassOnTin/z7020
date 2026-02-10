@@ -39,15 +39,16 @@ refresh_hw_device $device
 puts "=== Creating flash configuration ==="
 
 # Zynq-7000 requires device-specific cfgmem parts (generic parts not supported).
-# Try common 128Mbit QSPI flash chips in order of likelihood.
+# Board has W25Q256 (256Mbit) — try 256Mbit parts first, then 128Mbit fallback.
 # Run vivado/list_flash_parts.tcl to see all parts valid for your device.
 set flash_candidates {
+    "w25q256fv-qspi-x1-single"
+    "w25q256jv-qspi-x1-single"
+    "mt25ql256-qspi-x1-single"
+    "is25lp256d-qspi-x1-single"
+    "n25q256-3.3v-qspi-x1-single"
     "w25q128fv-qspi-x1-single"
     "w25q128fw-qspi-x1-single"
-    "is25lp128f-qspi-x1-single"
-    "mt25ql128-qspi-x1-single"
-    "s25fl127s-3.3v-qspi-x4-single"
-    "n25q128-3.3v-qspi-x1-single"
 }
 
 set flash_part ""
@@ -94,7 +95,7 @@ if {[catch {program_hw_cfgmem $cfgmem} err]} {
     puts "ERROR: Flash programming failed: $err"
     puts ""
     puts "Common causes:"
-    puts "  - Flash chip not 128Mbit: try a different cfgmem part"
+    puts "  - Flash chip mismatch: try a different cfgmem part"
     puts "  - FSBL PS7 config doesn't match board: regenerate with create_fsbl.tcl"
     puts "  - JTAG connection issue: check cable and power"
     close_hw_manager

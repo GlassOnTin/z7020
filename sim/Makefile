@@ -17,7 +17,7 @@ SIM_DIR  = .
 # RTL sources
 RTL_COMMON = $(RTL_DIR)/fixed_mul.v
 
-.PHONY: all test_all test_mul test_neuron ref clean
+.PHONY: all test_all test_mul test_neuron test_scheduler ref clean
 
 all: test_all
 
@@ -40,9 +40,18 @@ tb_neuron_core.vvp: tb_neuron_core.v $(RTL_COMMON) $(RTL_DIR)/neuron_core.v
 	$(IVERILOG) -o $@ -I$(RTL_DIR) $^
 
 # ============================================
+# Pixel scheduler test
+# ============================================
+test_scheduler: tb_pixel_scheduler.vvp
+	$(VVP) $<
+
+tb_pixel_scheduler.vvp: tb_pixel_scheduler.v $(RTL_DIR)/pixel_scheduler.v
+	$(IVERILOG) -o $@ -I$(RTL_DIR) $^
+
+# ============================================
 # All tests
 # ============================================
-test_all: test_mul test_neuron
+test_all: test_mul test_neuron test_scheduler
 
 # ============================================
 # Python reference

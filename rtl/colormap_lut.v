@@ -27,7 +27,7 @@ module colormap_lut #(
     reg [15:0] palette [0:PALETTE_SZ-1];
 
     // Palette index: iter modulo 256 (just take low 8 bits)
-    wire [7:0] pal_idx = iter_count[7:0];
+    wire [7:0] pal_idx = iter_count[7:0] + 8'd1;
     wire       is_interior = (iter_count >= max_iter);
 
     // Single-cycle lookup with output register
@@ -73,10 +73,10 @@ module colormap_lut #(
         t = idx % 42;
 
         if (idx < 42) begin
-            // Phase 0: black → dark blue
+            // Phase 0: very dark blue → dark blue (never black, safety net for pal_idx offset)
             r = 0;
             g = 0;
-            b = (t * 128) / 42;
+            b = 8 + (t * 120) / 42;
         end else if (idx < 84) begin
             // Phase 1: dark blue → cyan
             r = 0;

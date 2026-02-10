@@ -90,6 +90,11 @@ module pixel_scheduler #(
     // =========================================================
     // Neuron assignment — find first ready neuron (without pending result)
     // =========================================================
+    // just_assigned: mask of neuron assigned last cycle. Neuron_ready has 1-cycle
+    // latency (neuron transitions from IDLE to LOAD on the cycle it sees valid),
+    // so the scheduler must not re-pick the same neuron on the very next cycle.
+    reg [N_NEURONS-1:0] just_assigned;
+
     reg [$clog2(N_NEURONS)-1:0] assign_neuron;
     reg                         found_ready;
 
@@ -98,7 +103,8 @@ module pixel_scheduler #(
         found_ready   = 0;
         assign_neuron = 0;
         for (k = 0; k < N_NEURONS; k = k + 1) begin
-            if (neuron_ready[k] && !result_pending[k] && !result_valid[k] && !found_ready) begin
+            if (neuron_ready[k] && !result_pending[k] && !result_valid[k]
+                && !just_assigned[k] && !found_ready) begin
                 assign_neuron = k;
                 found_ready   = 1;
             end
@@ -147,11 +153,13 @@ module pixel_scheduler #(
             fb_wr_addr     <= 0;
             fb_wr_data     <= 0;
             result_pending <= 0;
+            just_assigned  <= 0;
         end else begin
             // Defaults
-            neuron_valid <= 0;
-            fb_wr_en     <= 0;
-            frame_done   <= 0;
+            neuron_valid  <= 0;
+            fb_wr_en      <= 0;
+            frame_done    <= 0;
+            just_assigned <= 0;
 
             // ---- Capture result pulses into pending buffer ----
             // All neurons captured simultaneously — no lost results
@@ -183,7 +191,8 @@ module pixel_scheduler #(
             // ---- Pixel assignment ----
             if (frame_busy && !all_assigned && found_ready) begin
                 // Assign current pixel to the ready neuron
-                neuron_valid[assign_neuron] <= 1;
+                neuron_valid[assign_neuron]  <= 1;
+                just_assigned[assign_neuron] <= 1;
                 neuron_c_re    <= cur_c_re;
                 neuron_c_im    <= cur_c_im;
                 neuron_pixel_id <= pixel_count;
@@ -193,14 +202,12 @@ module pixel_scheduler #(
                 // Advance to next pixel
                 if (px == H_RES - 1) begin
                     px <= 0;
-                    cur_c_re <= row_c_re_start;  // Reset to row start (will add step on next assign)
                     if (py == V_RES - 1) begin
                         all_assigned <= 1;
                     end else begin
                         py <= py + 1;
-                        cur_c_im       <= cur_c_im + c_im_step;
-                        row_c_re_start <= row_c_re_start;  // Row start stays
-                        cur_c_re       <= row_c_re_start + c_re_step; // First pixel of next row
+                        cur_c_im <= cur_c_im + c_im_step;
+                        cur_c_re <= row_c_re_start;  // First pixel of new row
                     end
                 end else begin
                     px <= px + 1;

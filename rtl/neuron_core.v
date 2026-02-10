@@ -147,8 +147,8 @@ module neuron_core #(
     //   - If mag_sq >= 4.0, standard escape condition
     // Also check if z_re or z_im individually exceed ±4.0 (catches cases where
     // the multiply itself overflows before we can detect via mag_sq)
-    wire z_re_overflow = (z_re[WIDTH-1] != z_re[WIDTH-2]) && (z_re[WIDTH-2] != z_re[WIDTH-3]);
-    wire z_im_overflow = (z_im[WIDTH-1] != z_im[WIDTH-2]) && (z_im[WIDTH-2] != z_im[WIDTH-3]);
+    wire z_re_overflow = (z_re[WIDTH-1] != z_re[WIDTH-2]);
+    wire z_im_overflow = (z_im[WIDTH-1] != z_im[WIDTH-2]);
     assign escaped = (mag_sq[WIDTH-1]) || (mag_sq >= ESCAPE_THRESHOLD) ||
                      z_re_overflow || z_im_overflow;
 

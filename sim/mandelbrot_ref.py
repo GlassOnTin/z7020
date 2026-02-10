@@ -133,5 +133,33 @@ def main():
         print(f"  {label:>12} ({px:3d},{py:3d}): c=({c_re:+.6f}, {c_im:+.6f}) iter={iters}")
 
 
+def row_start_vectors():
+    """Generate row-start golden vectors for scheduler testbench verification.
+
+    Verifies that every row starts at c_re_start (no off-by-one drift).
+    Uses the same viewport parameters as tb_pixel_scheduler.v.
+    """
+    h_res, v_res = 16, 8
+    c_re_start = -2.0
+    c_im_start = -1.0
+    step = 0.25
+
+    print("\n\nRow-start golden vectors (16x8 testbench viewport):")
+    print(f"  c_re_start = {c_re_start}  = {float_to_q428(c_re_start):08X}")
+    print(f"  c_im_start = {c_im_start}  = {float_to_q428(c_im_start):08X}")
+    print(f"  step       = {step}   = {float_to_q428(step):08X}")
+    print()
+    print(f"  {'Row':<6} {'c_re_start (hex)':<18} {'c_im (hex)':<18} {'c_re (float)':<14} {'c_im (float)'}")
+    print("  " + "=" * 70)
+
+    for row in range(v_res):
+        c_re = c_re_start  # Every row must start here (Bug #1 fix)
+        c_im = c_im_start + row * step
+        c_re_q = float_to_q428(c_re)
+        c_im_q = float_to_q428(c_im)
+        print(f"  {row:<6} {c_re_q:08X}             {c_im_q:08X}             {c_re:<+14.6f} {c_im:<+.6f}")
+
+
 if __name__ == "__main__":
     main()
+    row_start_vectors()
