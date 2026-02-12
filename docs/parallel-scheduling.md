@@ -57,8 +57,8 @@ if (px == H_RES - 1) begin
         all_assigned <= 1;               // Frame complete
     end else begin
         py <= py + 1;
-        cur_c_im       <= cur_c_im + c_im_step;
-        cur_c_re       <= row_c_re_start + c_re_step;  // First pixel of next row
+        cur_c_im <= cur_c_im + c_im_step;
+        cur_c_re <= row_c_re_start;      // Reset to left edge of next row
     end
 end else begin
     px <= px + 1;
@@ -78,7 +78,8 @@ always @(*) begin
     found_ready   = 0;
     assign_neuron = 0;
     for (k = 0; k < N_NEURONS; k = k + 1) begin
-        if (neuron_ready[k] && !result_pending[k] && !result_valid[k] && !found_ready) begin
+        if (neuron_ready[k] && !result_pending[k] && !result_valid[k]
+            && !just_assigned[k] && !found_ready) begin
             assign_neuron = k;
             found_ready   = 1;
         end
@@ -86,7 +87,11 @@ always @(*) begin
 end
 ```
 
-This is a first-found priority encoder — it always picks the lowest-numbered idle neuron. The `!result_pending[k]` condition prevents assigning new work to a neuron whose previous result hasn't been drained to the framebuffer yet. The `!result_valid[k]` condition avoids assigning during the same cycle a result pulse fires.
+This is a first-found priority encoder — it always picks the lowest-numbered idle neuron. Four guard conditions prevent incorrect assignment:
+
+- `!result_pending[k]`: Don't assign work to a neuron whose previous result hasn't been drained to the framebuffer yet
+- `!result_valid[k]`: Don't assign during the same cycle a result pulse fires
+- `!just_assigned[k]`: Don't re-pick the same neuron on the very next cycle — `neuron_ready` has 1-cycle latency (the neuron transitions from S_IDLE to S_LOAD on the cycle it sees `pixel_valid`), so without this guard the scheduler would assign two pixels to the same neuron before it deasserts `pixel_ready`
 
 When a ready neuron is found, the scheduler drives the shared coordinate bus and asserts that neuron's individual `valid` signal:
 
@@ -187,10 +192,10 @@ For a typical frame with `max_iter = 256`:
   Total compute cycles         ≈ 55,040 × 180 / 18 = 550,400
   Time at 50 MHz              ≈ 11 ms
 
-  SPI frame time               ≈ 70 ms  (55,040 × 2 bytes × 16 bits / 25 MHz)
+  SPI frame time               ≈ 40 ms  (110,080 bytes × 18 cycles × 20 ns)
 ```
 
-The compute engine finishes each frame ~6× faster than the SPI can display it, so the display is the bottleneck. Interior-heavy viewports (high average iteration count) can push compute time higher, but even at max_iter = 1024 with a mostly-interior viewport, the 18-neuron pool keeps up.
+The compute engine finishes each frame ~4× faster than the SPI can display it, so the display is the bottleneck. Interior-heavy viewports (high average iteration count) can push compute time higher, but even at max_iter = 1024 with a mostly-interior viewport, the 18-neuron pool keeps up.
 
 ## Frame Start Sequence
 

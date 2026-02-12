@@ -61,7 +61,7 @@ The design is a single-clock datapath that generates Mandelbrot set images and s
 
 ## Data Flow
 
-The pipeline processes one frame in five stages:
+The pipeline processes one frame in six stages:
 
 ### 1. Viewport Setup (Auto-Zoom Controller)
 
@@ -75,13 +75,17 @@ The auto-zoom controller in `mandelbrot_top.v` provides viewport parameters to t
 
 Eighteen `neuron_core` instances iterate z = z² + c independently. Each neuron has three pipelined fixed-point multipliers running in parallel (z_re², z_im², z_re×z_im), giving a throughput of one iteration per 4 clock cycles. When a neuron escapes or reaches `max_iter`, it emits a one-cycle `result_valid` pulse with the pixel ID and final iteration count. See [neuron-core.md](neuron-core.md).
 
-### 4. Color Mapping
+### 4. Color Sweep
 
-`colormap_lut.v` translates the 16-bit iteration count to a 16-bit RGB565 color via a 256-entry cyclic palette. Interior points (iteration count >= max_iter) map to black. The palette follows a classic fractal color scheme: dark blue, cyan, yellow, orange, red/brown, looping every 256 iterations.
+After compute completes, a sweep state machine reads all 55,040 entries from `iter_fb` sequentially through the colormap and writes the resulting RGB565 values into the back display framebuffer. This takes ~1.1 ms (55,040 + 2 flush cycles at 50 MHz). The sweep is gated by `sweep_wr_v1` to avoid writing stale addresses during the first 2 pipeline-fill cycles.
 
-### 5. Display Output (SPI Driver)
+### 5. Buffer Swap
 
-`sp2_spi_driver.v` continuously reads the display framebuffer and streams RGB565 pixels over SPI to the ST7789V3 LCD. It handles hardware reset, sleep-out, initialization commands, window setup, and pixel data. At 25 MHz SCK, a full 320x172 frame takes approximately 70 ms to transfer. See [spi-display-driver.md](spi-display-driver.md).
+When the sweep finishes, a swap is armed (`swap_pending`). The actual buffer swap occurs at the next SPI frame boundary (`disp_frame_done`), toggling `disp_buf_sel`. This ensures the SPI driver always reads a complete, consistent frame. The auto-zoom controller then updates the viewport and pulses `frame_start` for the next compute cycle.
+
+### 6. Display Output (SPI Driver)
+
+`sp2_spi_driver.v` continuously reads the display framebuffer and streams RGB565 pixels over SPI to the ST7789V3 LCD. It handles hardware reset, sleep-out, initialization commands, window setup, and pixel data. At 25 MHz SCK, a full 320x172 frame takes approximately 40 ms to transfer (~25 FPS). See [spi-display-driver.md](spi-display-driver.md).
 
 ## Clock Domain
 
@@ -106,31 +110,38 @@ This ensures a clean, synchronous reset release regardless of button bounce timi
 
 ## Memory Architecture
 
-Two dual-port BRAMs serve as framebuffers, both sized to 65,536 entries (2^16) for clean BRAM inference even though only 55,040 pixels are used:
+Three dual-port BRAMs serve as framebuffers, all sized to 65,536 entries (2^16) for clean BRAM inference even though only 55,040 pixels are used:
 
 | Buffer | Width | Depth | Content | Port A (Write) | Port B (Read) |
 |--------|-------|-------|---------|-----------------|---------------|
-| `iter_fb` | 16-bit | 65536 | Iteration counts | Scheduler results | Colormap input |
-| `disp_fb` | 16-bit | 65536 | RGB565 pixels | Colormap output | SPI driver |
+| `iter_fb` | 16-bit | 65536 | Iteration counts | Scheduler results | Colormap sweep |
+| `disp_fb_a` | 16-bit | 65536 | RGB565 pixels | Colormap (when back) | SPI driver (when front) |
+| `disp_fb_b` | 16-bit | 65536 | RGB565 pixels | Colormap (when back) | SPI driver (when front) |
 
-Both are annotated with `(* ram_style = "block" *)` to force BRAM inference. The `iter_fb` buffer is addressed by pixel ID (assigned by the scheduler in row-major order), so results from neurons can arrive in any order and still land in the correct framebuffer location.
+All are annotated with `(* ram_style = "block" *)` to force BRAM inference. The `iter_fb` buffer is addressed by pixel ID (assigned by the scheduler in row-major order), so results from neurons can arrive in any order and still land in the correct framebuffer location.
 
-The colormap sits between the two framebuffers, continuously reading `iter_fb` at the address driven by the SPI driver and writing the resulting RGB565 into `disp_fb`. A 2-stage address pipeline compensates for the colormap's 1-cycle latency:
+### Double-Buffered Display
+
+The two display framebuffers (`disp_fb_a`, `disp_fb_b`) form a double-buffer pair controlled by `disp_buf_sel`:
+
+- When `disp_buf_sel = 0`: SPI reads from A (front), colormap writes to B (back)
+- When `disp_buf_sel = 1`: SPI reads from B (front), colormap writes to A (back)
+
+After each compute frame completes, a **color sweep** reads all 55,040 entries from `iter_fb` through the colormap and writes the resulting RGB565 values into the back display buffer. When the sweep finishes (`sweep_done`), a swap is armed. The actual buffer swap occurs at the next SPI frame boundary (`disp_frame_done`), ensuring the display never shows a partially-written frame.
+
+The colormap write pipeline uses a 2-stage address delay to compensate for the BRAM read latency and colormap lookup latency:
 
 ```verilog
 always @(posedge clk) begin
-    iter_fb_rd_addr <= fb_disp_addr;     // SPI driver address → iter FB
-end
-
-always @(posedge clk) begin
     color_wr_addr   <= iter_fb_rd_addr;  // Pipeline stage 1
     color_wr_addr_d <= color_wr_addr;    // Pipeline stage 2 (matches colormap latency)
-    if (color_valid)
-        disp_fb[color_wr_addr_d] <= color_rgb565;
 end
+
+wire wr_en_a = color_wr_en &  disp_buf_sel;  // buf_sel=1 → write to A (back)
+wire wr_en_b = color_wr_en & ~disp_buf_sel;  // buf_sel=0 → write to B (back)
 ```
 
-This means the display framebuffer is continuously updated while the SPI driver reads it. There is no explicit double-buffering or frame synchronization between compute and display — the display simply shows whatever has been written so far. For a smooth zoom animation this works well: partial frames briefly show a mix of old and new data, but at the zoom speeds involved this is imperceptible.
+A delayed `sweep_wr_v1` signal gates writes so the first 2 cycles of the sweep (which carry stale addresses from the display path) don't corrupt the back buffer.
 
 ## Module Hierarchy
 
@@ -142,10 +153,11 @@ mandelbrot_top
 │   └── fixed_mul (mul_c)     z_re * z_im
 ├── pixel_scheduler × 1
 ├── colormap_lut × 1
-└── sp2_spi_driver × 1
+├── sp2_spi_driver × 1
+└── boot_msg × 1              UART "MANDELBROT QSPI OK\r\n"
 ```
 
-Plus the two BRAM framebuffers and the auto-zoom controller, both inlined in `mandelbrot_top.v`.
+Plus the three BRAM framebuffers (`iter_fb`, `disp_fb_a`, `disp_fb_b`), the color sweep state machine, and the auto-zoom controller, all inlined in `mandelbrot_top.v`.
 
 ## Key Design Decisions
 
@@ -153,6 +165,6 @@ Plus the two BRAM framebuffers and the auto-zoom controller, both inlined in `ma
 
 **Why Q4.28 fixed-point?** The Zynq-7020's DSP48E1 slices have 25x18 signed multipliers with no floating-point support. Fixed-point maps directly to DSP hardware with deterministic latency. Q4.28 provides 4 integer bits (range ±8.0, sufficient for the Mandelbrot set's [-2, 2] domain) and 28 fractional bits (~3.7e-9 resolution). See [fixed-point-arithmetic.md](fixed-point-arithmetic.md).
 
-**Why no double-buffering?** With 18 neurons at 50 MHz, a 256-iteration frame computes in roughly 49 ms — comparable to the ~70 ms SPI transfer time. Double-buffering would add 128 KB of BRAM (doubling the 46% utilization to 92%) for minimal visual benefit in a zoom animation where every frame is unique.
+**Why double-buffer the display?** Compute frames finish in ~11 ms but the SPI transfer takes ~40 ms. Without double-buffering, the colormap would overwrite display pixels mid-transfer, causing tearing. The two display BRAMs (`disp_fb_a`, `disp_fb_b`) swap at SPI frame boundaries so the display always reads a complete frame. The cost is ~128 KB of additional BRAM (raising utilization from ~30% to ~46%).
 
 **Why 65536-deep framebuffers for 55040 pixels?** BRAM inference in Vivado works most reliably with power-of-two depths. The extra 10,496 entries waste no physical resources since the 36Kb BRAMs are allocated in whole blocks regardless.

@@ -25,7 +25,7 @@
 //   Cycle 4:     Update z, increment iter, or halt
 //
 // Throughput: 1 iteration per 4 clock cycles
-// At 150 MHz: 37.5 million iterations/sec per neuron
+// At 50 MHz: 12.5 million iterations/sec per neuron
 
 `timescale 1ns / 1ps
 

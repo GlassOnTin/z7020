@@ -7,7 +7,7 @@
 //   - DC:    Data/Command select (0=command, 1=data)
 //   - RST_N: Hardware reset (active low)
 //
-// Timing: reset 15ms, wait 15ms, send SLPOUT, wait 120ms, init, display on.
+// Timing: reset 120ms, wait 120ms, send SLPOUT, wait 120ms, init, display on.
 
 `timescale 1ns / 1ps
 
@@ -246,7 +246,7 @@ module sp2_spi_driver #(
             start_byte <= 0;
 
             case (state)
-                // ---- Assert hardware reset for 15ms ----
+                // ---- Assert hardware reset for 120ms ----
                 ST_RESET: begin
                     lcd_rst_n <= 0;
                     lcd_blk   <= 0;
@@ -260,7 +260,7 @@ module sp2_spi_driver #(
                     end
                 end
 
-                // ---- Wait 15ms after reset release ----
+                // ---- Wait 120ms after reset release ----
                 ST_RESET_REL: begin
                     if (wait_cnt == RST_WAIT) begin
                         wait_cnt <= 0;

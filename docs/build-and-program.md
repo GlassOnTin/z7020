@@ -190,7 +190,7 @@ This opens the hardware manager, connects to the JTAG target (xc7z020_1), and pr
 
 After programming:
 - **LED2 (alive)**: Should blink at 1 Hz immediately — confirms the FPGA is configured and running
-- **LED1 (frame)**: Should toggle every ~70 ms — confirms compute frames are completing
+- **LED1 (frame)**: Should toggle every ~40 ms — confirms compute frames are completing
 - **Display**: Shows the Mandelbrot set, then begins auto-zooming into the seahorse valley
 
 If LED2 blinks but the display is blank:

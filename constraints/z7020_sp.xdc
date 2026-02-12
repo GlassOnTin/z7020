@@ -1,7 +1,7 @@
 ## z7020_sp.xdc — Pin constraints for Smart ZYNQ SP board (HelloFPGA)
 ##
 ## Pin assignments from carrier board schematic page 11 pin mapping table.
-## Board: Hello-FPGA Smart ZYNQ SP, XC7Z020CLG400-1 (industrial)
+## Board: Hello-FPGA Smart ZYNQ SP, XC7Z020CLG484-1 (industrial)
 
 ## ============================================
 ## Clock — 50 MHz PL crystal oscillator

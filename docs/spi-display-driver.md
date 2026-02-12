@@ -157,19 +157,17 @@ After initialization, the driver enters a continuous frame loop:
 
 ### Frame Timing
 
-At 25 MHz SCK, each byte takes 8 SCK cycles = 16 system clocks (320 ns). Each pixel is 2 bytes:
+At 25 MHz SCK (SCK_DIV=0), each byte takes 16 system clocks of shifting (8 bits × 2 phases) plus 2 idle clocks for the `start_byte`/`byte_done` handshake = 18 system clocks (360 ns). Each pixel is 2 bytes:
 
 ```
-  Pixel time   = 640 ns
+  Byte time    = 18 × 20 ns = 360 ns
+  Pixel time   = 2 bytes × 360 ns = 720 ns
   Frame pixels = 55,040
-  Pixel data   = 55,040 × 640 ns = 35.2 ms
-  + Window setup (11 command bytes) ≈ 3.5 µs
-  + Inter-byte gaps ≈ negligible
+  Pixel data   = 55,040 × 720 ns = 39.6 ms
+  + Window setup (11 bytes × 360 ns) ≈ 4 µs
 
-  Total frame time ≈ 35.2 ms → ~28 FPS theoretical
+  Total frame time ≈ 39.6 ms → ~25 FPS
 ```
-
-In practice, the measured frame rate is approximately 14 FPS due to byte-level handshaking overhead (the `start_byte`/`byte_done` protocol adds one idle cycle between bytes).
 
 ## Framebuffer Interface
 

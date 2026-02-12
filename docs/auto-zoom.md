@@ -179,7 +179,7 @@ The vertical range is 172 × 0.009375 = 1.6125, centered at 0, spanning [-0.8062
 | Phase | Duration | Notes |
 |-------|----------|-------|
 | Compute frame (typical) | ~11 ms | 18 neurons, avg 45 iter/pixel |
-| SPI display frame | ~70 ms | 55,040 pixels × 2 bytes × 25 MHz |
+| SPI display frame | ~40 ms | 110,080 bytes × 18 clocks × 20 ns |
 | Zoom overhead | 1 cycle | Shift-add, no multiplier |
 | Frames to 1000× zoom | ~441 | (63/64)^441 ≈ 0.001 |
 | Full zoom cycle | ~1000 frames | Reset around frame ~600-700 |

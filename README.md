@@ -47,7 +47,7 @@ A real-time Mandelbrot set explorer running on a Xilinx Zynq-7020 FPGA, renderin
 
 - **18 parallel neuron cores** — each running z = z² + c with 3 pipelined multipliers (216 of 220 DSP48E1 slices)
 - **Q4.28 fixed-point arithmetic** — 32-bit signed, ~3.7 ns resolution, ~156,000x zoom before precision exhaustion
-- **25 MHz SPI** to ST7789V3 LCD — continuous frame streaming at ~14 FPS display refresh
+- **25 MHz SPI** to ST7789V3 LCD — continuous frame streaming at ~25 FPS display refresh
 - **Auto-zoom screensaver** — smooth zoom into the seahorse valley, automatically loops when precision is exhausted
 - **Single 50 MHz clock domain** — no clock-domain crossing complexity
 - **Dual-port BRAM framebuffers** — separate compute and display paths, zero tearing

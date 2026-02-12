@@ -119,22 +119,20 @@ With 18 neurons: **225 million iterations per second** aggregate.
 The escape condition is more involved than a simple magnitude check because fixed-point overflow must be handled:
 
 ```verilog
-wire z_re_overflow = (z_re[WIDTH-1] != z_re[WIDTH-2])
-                  && (z_re[WIDTH-2] != z_re[WIDTH-3]);
-wire z_im_overflow = (z_im[WIDTH-1] != z_im[WIDTH-2])
-                  && (z_im[WIDTH-2] != z_im[WIDTH-3]);
+wire z_re_overflow = (z_re[WIDTH-1] != z_re[WIDTH-2]);
+wire z_im_overflow = (z_im[WIDTH-1] != z_im[WIDTH-2]);
 
 assign escaped = (mag_sq[WIDTH-1])               // Negative mag_sq → overflow
               || (mag_sq >= ESCAPE_THRESHOLD)      // |z|² ≥ 4.0
-              || z_re_overflow                     // z_re out of Q4.28 range
-              || z_im_overflow;                    // z_im out of Q4.28 range
+              || z_re_overflow                     // z_re exceeds ±4.0
+              || z_im_overflow;                    // z_im exceeds ±4.0
 ```
 
 Three cases:
 
 1. **Standard escape**: `mag_sq >= 4.0` in Q4.28 representation (`0x4000_0000`)
 2. **Magnitude overflow**: If `z_re² + z_im²` overflows the 32-bit signed range (goes negative), the point has definitely escaped
-3. **Component overflow**: If z_re or z_im individually overflow the ±8.0 range of Q4.28, the subsequent multiply would produce garbage — so we catch it early by checking if the top bits are inconsistent with two's complement sign extension
+3. **Component overflow**: If z_re or z_im individually exceed ±4.0 (sign bit disagrees with the MSB of the integer part), the subsequent squaring could overflow the Q4.28 range and produce incorrect mag_sq values — so we catch it early with a single-bit sign consistency check
 
 ## Handshake Protocol
 
