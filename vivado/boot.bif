@@ -1,8 +1,8 @@
-// boot.bif — Zynq-7000 QSPI boot image format
+// boot.bif — Zynq-7000 SD boot image format
 //
-// Combines the FSBL and PL bitstream into a single boot image.
-// The Zynq BootROM loads the FSBL from QSPI flash, then the FSBL
-// configures the PL with the bitstream.
+// Combines the FSBL, PL bitstream, and U-Boot into a single boot image.
+// Boot chain: BootROM → FSBL → bitstream (PL) + U-Boot (PS)
+// U-Boot auto-runs "ums 0 mmc 0" to expose SD card as USB mass storage.
 //
 // Usage: bootgen -image boot.bif -arch zynq -o BOOT.bin -w
 
@@ -10,4 +10,5 @@ the_ROM_image:
 {
     [bootloader] boot/fsbl/executable.elf
     mandelbrot/mandelbrot.runs/impl_1/mandelbrot_top.bit
+    ../u-boot/u-boot.elf
 }

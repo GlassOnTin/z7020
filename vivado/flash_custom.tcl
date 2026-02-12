@@ -89,6 +89,11 @@ if {$mfr == 0 || $mfr == 0xFF} {
     exit 1
 }
 
+# Report QE (Quad Enable) bit status from SR2
+set sr2 [mrd -force -value 0x0002001C]
+set qe_set [expr {($sr2 >> 1) & 1}]
+puts "  SR2: [format 0x%02X [expr {$sr2 & 0xFF}]] — QE bit: $qe_set [expr {$qe_set ? "(OK)" : "(WARNING: not set)"}]"
+
 # Step 4: Erase + Program
 puts ""
 puts "=== Step 4: Erasing and programming flash ==="

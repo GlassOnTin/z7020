@@ -37,6 +37,12 @@ A real-time Mandelbrot set explorer running on a Xilinx Zynq-7020 FPGA, renderin
                                                    └─────────┘
 ```
 
+![Board running Mandelbrot zoom](docs/board_front_mandelbrot_running.jpg)
+*Smart ZYNQ SP board running the auto-zoom demo on the 1.47" ST7789V3 display*
+
+![Carrier board back with pinout](docs/board_back_carrier_pinout.jpg)
+*Carrier board back showing Bank 33/35 GPIO headers and pin silkscreen*
+
 ## Features
 
 - **18 parallel neuron cores** — each running z = z² + c with 3 pipelined multipliers (216 of 220 DSP48E1 slices)

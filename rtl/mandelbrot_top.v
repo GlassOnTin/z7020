@@ -36,7 +36,10 @@ module mandelbrot_top #(
 
     // Debug
     output wire        led_frame,     // Toggles each frame
-    output wire        led_alive      // 1Hz blink — proves FPGA is running
+    output wire        led_alive,     // 1Hz blink — proves FPGA is running
+
+    // UART
+    output wire        uart_tx        // 115200 8N1 boot message
 );
 
     // =========================================================
@@ -490,6 +493,15 @@ module mandelbrot_top #(
     // Backlight pass-through from SPI driver
     wire lcd_blk_int;
     assign lcd_blk_out = lcd_blk_int;
+
+    // =========================================================
+    // UART boot message — sends "MANDELBROT QSPI OK\r\n" once
+    // =========================================================
+    boot_msg u_boot_msg (
+        .clk   (clk),
+        .rst_n (rst_n),
+        .tx    (uart_tx)
+    );
 
     // =========================================================
     // Alive LED — 1 Hz blink (25M counter at 50 MHz)

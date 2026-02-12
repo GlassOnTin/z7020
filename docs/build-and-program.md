@@ -46,13 +46,20 @@ SCK and MOSI have FAST slew rate and 8 mA drive strength configured in the XDC f
 | led_frame | P20 | LED1 — toggles per compute frame |
 | led_alive | P21 | LED2 — 1 Hz heartbeat |
 
+### PL UART (Boot Diagnostics)
+
+| Signal | Pin | Bank | Standard |
+|--------|-----|------|----------|
+| uart_tx | L17 | 35 | LVCMOS33 |
+
+L17 is routed to FT2232H Channel B (ttyUSB1 on host). Read with pyserial at 115200 8N1 (`cat /dev/ttyUSB1` does not work). The `boot_msg` module sends `MANDELBROT QSPI OK\r\n` repeating every ~2 seconds to confirm the PL bitstream is running.
+
 ### Other Available Pins (Not Used)
 
 | Signal | Pin | Notes |
 |--------|-----|-------|
 | KEY2 | J20 | Second pushbutton |
-| UART TX | L17 | PS UART (for future AXI-Lite control) |
-| UART RX | M17 | PS UART |
+| UART RX | M17 | PL UART receive (FT2232H Channel B) |
 
 ## Toolchain
 
@@ -68,23 +75,41 @@ source ~/Code/z7020/env.sh
 
 This sources Vivado's `settings64.sh` and adds `vivado`, `hw_server`, and related tools to `PATH`.
 
-## Remote Build Setup
+## Development Setup
 
-The project is developed on a Raspberry Pi 5 (for proximity to the FPGA board) with synthesis running on a remote x86_64 workstation (where Vivado is installed). The source tree is shared via SSHFS:
+Primary development is on the x86_64 workstation (msi-z790) where Vivado is installed. The FPGA board connects via USB for JTAG programming.
 
 ```
-  Raspberry Pi 5                      x86_64 Workstation (msi-z790)
-  ─────────────                       ─────────────────────────────
-  ~/Code/z7020/  ◀── SSHFS mount ──▶  /opt/Xilinx/2025.2/
-  (edit RTL)                          (run Vivado synthesis)
+  x86_64 Workstation (msi-z790)
+  ─────────────────────────────
+  ~/Code/z7020/           Project source tree
+  /opt/Xilinx/2025.2/    Vivado toolchain
 
-  FPGA board ◀── USB cable ──▶ Pi ◀── USB/IP ──▶ Workstation
-  (JTAG)                                          (hw_server)
+  FPGA board ◀── USB cable ──▶ msi-z790
+  (JTAG + UART via FT2232H)
 ```
 
-## JTAG over USB/IP
+An alternative setup uses a Raspberry Pi 5 for proximity to the FPGA board, with synthesis running remotely on msi-z790 via SSH. The source tree is shared via SSHFS and the JTAG USB device is forwarded using `usbip`.
 
-The FPGA board's JTAG interface (FT2232H) connects to the Raspberry Pi via USB. For programming from the remote workstation, `usbip` forwards the USB device over the network:
+## JTAG
+
+The FPGA board's JTAG interface (FT2232H) provides two USB endpoints:
+- **ttyUSB0** (Channel A): JTAG — claimed by `hw_server`
+- **ttyUSB1** (Channel B): UART — 115200 8N1, read with pyserial
+
+When the board is connected directly to msi-z790:
+
+```bash
+# Start hw_server (if not already running):
+hw_server &
+
+# Program via JTAG:
+vivado -mode batch -source vivado/program.tcl > /tmp/program.log 2>&1
+```
+
+### JTAG over USB/IP (Remote Pi Setup)
+
+When using the Pi setup, `usbip` forwards the USB device over the network:
 
 ```bash
 # On the Pi (server):
@@ -95,8 +120,6 @@ sudo usbipd -D                         # Start USB/IP daemon
 ./fpga-jtag.sh status                   # Check connection
 ./fpga-jtag.sh detach                   # Release when done
 ```
-
-The `fpga-jtag.sh` script wraps `usbip attach/detach` with the correct device bus ID and server address.
 
 ## Build Flow
 
@@ -197,25 +220,53 @@ vivado -mode batch -source vivado/program.tcl           # Program
 
 The timing constraint is straightforward — at 50 MHz (20 ns period), the design has substantial margin. All paths meet timing comfortably.
 
-## QSPI Flash Boot (Persistent)
+## Persistent Boot (Power-On Auto-Start)
 
-JTAG programming is volatile — the design is lost on power-off. To make the Mandelbrot explorer start automatically at power-on, write the bitstream to the board's QSPI flash.
+JTAG programming is volatile — the design is lost on power-off. To make the Mandelbrot explorer start automatically at power-on, we use a Zynq boot image (BOOT.bin) containing an FSBL + bitstream.
 
-The board has a BOOT jumper with three positions: **JTAG**, **QSPI**, and **SD**. For flash boot, the jumper must be set to **QSPI**.
+The board has a BOOT jumper (S1/S2) with three positions: **JTAG**, **QSPI**, and **SD**.
 
-### How Zynq QSPI Boot Works
+### How Zynq Boot Works
 
-On a Zynq-7000, the PL (FPGA fabric) cannot load directly from flash. Instead, the PS (ARM core) boots first:
+On a Zynq-7000, the PL (FPGA fabric) cannot load directly from storage. Instead, the PS (ARM core) boots first:
 
 ```
-  Power-on → PS BootROM → loads FSBL from QSPI → FSBL configures PL → design runs
+  Power-on → PS BootROM → loads FSBL → FSBL configures PL → design runs
 ```
 
-1. **BootROM**: Hardwired in silicon, reads the boot image header from QSPI flash
-2. **FSBL** (First Stage Boot Loader): Minimal ARM program that initializes the PS clocks, reads the bitstream from flash, and configures the PL
+1. **BootROM**: Hardwired in silicon, reads BOOT.bin from the selected boot device
+2. **FSBL** (First Stage Boot Loader): Minimal ARM program that initializes PS clocks, DDR, and MIO, reads the bitstream, and configures the PL
 3. **PL configuration**: The FSBL writes the bitstream into the PL via the PCAP interface
 
 Even though our design is PL-only (no ARM software), we need the FSBL as a bootstrap mechanism. The FSBL runs, loads the bitstream, and then the ARM idles while the PL runs the Mandelbrot explorer.
+
+### QSPI Boot — BROKEN (BootROM v2.0 Bug)
+
+**QSPI boot does not work on this board.** The silicon (XC7Z020 rev 2.0, PSS_IDCODE=0x23727093) has a BootROM that does not configure MIO[1-6] L0_SEL=1, which is required for QSPI controller signals to reach the flash chip. Without L0_SEL=1, the QSPI flash is electrically disconnected from the Zynq's SPI controller at power-on.
+
+This is a chicken-and-egg problem:
+- The BootROM needs to read BOOT.bin from flash to find the register init table
+- The register init table would set L0_SEL=1 to enable flash access
+- But L0_SEL=0 at POR means the BootROM can't read the flash at all
+
+A scan of the entire 64KB BootROM (0xFFFF0000-0xFFFFFFFF) confirmed: **no MIO register addresses, no SLCR unlock key, no QSPI controller addresses exist in the ROM**. The BootROM simply does not have MIO initialization code for QSPI boot.
+
+The custom flash programmer (`flash_writer.c` + `flash_custom.tcl`) works correctly for writing to QSPI flash via JTAG, and the flash contents have been byte-verified. The hardware is fine — it's the BootROM that's broken.
+
+### SD Card Boot — RECOMMENDED
+
+Use SD card boot as the workaround. The FSBL auto-detects the boot device from the `BOOT_MODE` register and reads partitions accordingly — the same BOOT.bin works for both SD and QSPI.
+
+**SD card pinout** (core board MIO[40-45], Bank 501, 1.8V):
+
+| Signal | MIO | Package Pin |
+|--------|-----|-------------|
+| SD_CLK | MIO[40] | D14 |
+| SD_CMD | MIO[41] | C17 |
+| SD_D0 | MIO[42] | E12 |
+| SD_D1 | MIO[43] | A9 |
+| SD_D2 | MIO[44] | F13 |
+| SD_D3 | MIO[45] | B15 |
 
 ### Prerequisites
 
@@ -228,36 +279,32 @@ source ~/Code/z7020/env.sh              # Vivado in PATH
 ### Step 1: Generate FSBL (One-Time)
 
 ```bash
-vivado -mode batch -source vivado/create_fsbl.tcl > vivado/boot/create_fsbl.log 2>&1
+cd ~/Code/z7020/vivado
+vivado -mode batch -source create_fsbl.tcl > /tmp/create_fsbl.log 2>&1
 ```
 
-This creates a minimal PS7 block design with QSPI enabled, exports a hardware platform (XSA), and compiles the Zynq FSBL using `xsdb` + `arm-none-eabi-gcc`. The output is:
+This creates a PS7 block design with QSPI and SD0 (MIO[40-45]) enabled, exports a hardware platform (XSA), and compiles the FSBL using `xsdb` + `arm-none-eabi-gcc`. Output:
 
 ```
 vivado/boot/fsbl/executable.elf
 ```
 
-This FSBL only needs to be regenerated if the PS7 configuration changes (which it won't for PL-only designs).
+The FSBL only needs to be regenerated if the PS7 configuration changes.
 
 ### Step 2: Build Bitstream
 
-If not already done:
-
 ```bash
-vivado -mode batch -source vivado/run_all.tcl > vivado/build.log 2>&1
+vivado -mode batch -source vivado/run_all.tcl > /tmp/build.log 2>&1
 ```
 
-### Step 3: Create BOOT.bin and Program Flash
+### Step 3: Create BOOT.bin
 
 ```bash
-./vivado/program_qspi.sh
+cd ~/Code/z7020/vivado
+bootgen -image boot.bif -arch zynq -o BOOT.bin -w
 ```
 
-This script:
-1. Runs `bootgen` to package the FSBL + bitstream into `vivado/BOOT.bin`
-2. Programs the QSPI flash via JTAG (erase + write + verify, ~60 seconds)
-
-The boot image format is defined in `vivado/boot.bif`:
+The boot image format (`vivado/boot.bif`):
 
 ```
 the_ROM_image:
@@ -267,29 +314,37 @@ the_ROM_image:
 }
 ```
 
-### Step 4: Set Boot Mode
+### Step 4: Prepare SD Card
 
-Move the **BOOT** jumper from JTAG to **QSPI** and power-cycle the board. The Mandelbrot explorer starts automatically within ~1 second.
+1. Format a microSD card as **FAT32** (any size, even 1 GB works)
+2. Copy `vivado/BOOT.bin` to the **root** of the SD card (filename must be `BOOT.bin` or `BOOT.BIN`)
+3. Eject safely
 
-### Re-Flashing After Design Changes
+### Step 5: Boot
 
-After modifying the RTL and rebuilding the bitstream, you only need to repeat steps 2 and 3 — the FSBL doesn't change:
+1. Insert the microSD card into the TF card slot on the carrier board
+2. Set S1/S2 jumper to **BOOT SD** mode
+3. Power cycle the board
+4. The Mandelbrot animation should appear on the LCD within ~1 second
+
+### Re-Building After Design Changes
+
+After modifying RTL and rebuilding the bitstream, only steps 2-4 are needed (the FSBL doesn't change):
 
 ```bash
-vivado -mode batch -source vivado/run_all.tcl > vivado/build.log 2>&1
-./vivado/program_qspi.sh
+vivado -mode batch -source vivado/run_all.tcl > /tmp/build.log 2>&1
+cd vivado && bootgen -image boot.bif -arch zynq -o BOOT.bin -w
+# Copy BOOT.bin to SD card
 ```
-
-### Flash Part Compatibility
-
-The `flash.tcl` script defaults to `s25fl128sxxxxxx0-spi-x1_x2_x4` (Spansion 128Mbit) and automatically tries common alternatives (Micron N25Q128, ISSI IS25LP128, Winbond W25Q128). If your board uses a different flash chip, check the marking on the IC and update the `flash_part` variable in `vivado/flash.tcl`.
 
 ### Troubleshooting
 
 **"FSBL not found"**: Run `vivado -mode batch -source vivado/create_fsbl.tcl` first.
 
-**Flash programming fails with "no configuration memory"**: The flash part name doesn't match your board's chip. Run `get_cfgmem_parts *spi*` in the Vivado TCL console to list supported parts, then update `flash.tcl`.
+**"arm-none-eabi-gcc not found"**: `sudo apt install gcc-arm-none-eabi`.
 
-**Board doesn't boot from QSPI**: Verify the BOOT jumper is in the QSPI position (not JTAG or SD). Check that the BOOT.bin was verified successfully during programming.
+**Board doesn't boot from SD**: Verify the S1/S2 jumper is in SD position. Check that the SD card is FAT32 formatted and BOOT.bin is at the root. Try a different SD card (some older cards have compatibility issues with 1.8V signaling).
 
-**"arm-none-eabi-gcc not found"**: Install the ARM bare-metal toolchain: `sudo apt install gcc-arm-none-eabi`.
+**No display but UART shows "MANDELBROT QSPI OK"**: The PL bitstream loaded successfully. Check LCD ribbon cable and SPI connections.
+
+**No UART output and no display**: The FSBL may have failed. Try programming via JTAG first to verify the bitstream works, then retry SD boot.

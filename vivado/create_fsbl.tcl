@@ -1,7 +1,7 @@
-# create_fsbl.tcl — Generate FSBL for Zynq-7020 QSPI boot
+# create_fsbl.tcl — Generate FSBL for Zynq-7020 boot (QSPI + SD)
 #
 # Creates a minimal PS7 hardware platform and generates the First Stage
-# Boot Loader (FSBL) needed for QSPI boot images.
+# Boot Loader (FSBL) for boot images.
 #
 # This is a ONE-TIME setup step. The generated FSBL is reused for all
 # subsequent bitstream updates.
@@ -34,21 +34,28 @@ create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 ps7_0
 
 # Configure PS7 for this board (Hello-FPGA Smart ZYNQ SP)
 # From core board schematic:
-#   PS clock: 50 MHz (Y2 oscillator — verify with schematic)
-#   DDR3L: 2x NT5CC256M16EP-DI (4Gbit each, 32-bit bus, 1.35V)
-#          Pin-compatible with Micron MT41K256M16 RE-125
-#   MIO bank 0: 3.3V, MIO bank 1: 1.8V
-#   QSPI: W25Q256 on MIO 1-6
+#   PS clock: 50 MHz (Y2 oscillator)
+#   DDR3L: MT41K256M16 (single chip, 16-bit bus, 1.35V)
+#   MIO bank 0: 3.3V (QSPI, PS UART)
+#   MIO bank 1: 1.8V (Ethernet, USB, SD, eMMC)
+#   QSPI: W25Q128 on MIO[1-6]
+#   SD0: TF card on MIO[40-45]
 set_property -dict [list \
     CONFIG.PCW_CRYSTAL_PERIPHERAL_FREQMHZ {50} \
     CONFIG.PCW_QSPI_PERIPHERAL_ENABLE {1} \
     CONFIG.PCW_QSPI_GRP_SINGLE_SS_ENABLE {1} \
     CONFIG.PCW_USE_M_AXI_GP0 {0} \
     CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {50} \
-    CONFIG.PCW_UART0_PERIPHERAL_ENABLE {0} \
+    CONFIG.PCW_UART0_PERIPHERAL_ENABLE {1} \
+    CONFIG.PCW_UART0_UART0_IO {MIO 14 .. 15} \
     CONFIG.PCW_ENET0_PERIPHERAL_ENABLE {0} \
-    CONFIG.PCW_SD0_PERIPHERAL_ENABLE {0} \
-    CONFIG.PCW_USB0_PERIPHERAL_ENABLE {0} \
+    CONFIG.PCW_SD0_PERIPHERAL_ENABLE {1} \
+    CONFIG.PCW_SD0_SD0_IO {MIO 40 .. 45} \
+    CONFIG.PCW_SD0_GRP_CD_ENABLE {0} \
+    CONFIG.PCW_SD0_GRP_WP_ENABLE {0} \
+    CONFIG.PCW_SD0_GRP_POW_ENABLE {0} \
+    CONFIG.PCW_USB0_PERIPHERAL_ENABLE {1} \
+    CONFIG.PCW_USB0_USB0_IO {MIO 28 .. 39} \
     CONFIG.PCW_TTC0_PERIPHERAL_ENABLE {0} \
     CONFIG.PCW_GPIO_MIO_GPIO_ENABLE {0} \
     CONFIG.PCW_PRESET_BANK0_VOLTAGE {LVCMOS 3.3V} \
@@ -145,7 +152,7 @@ if {[file exists "$boot_dir/fsbl/executable.elf"]} {
     puts "=== FSBL generated successfully ==="
     puts "FSBL: $boot_dir/fsbl/executable.elf"
     puts ""
-    puts "Next: run program_qspi.sh to create BOOT.bin and flash it."
+    puts "Next: create BOOT.bin and copy to SD card or flash to QSPI."
 } else {
     puts "ERROR: FSBL ELF not found at $boot_dir/fsbl/executable.elf"
     exit 1

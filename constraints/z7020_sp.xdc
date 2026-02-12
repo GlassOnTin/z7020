@@ -32,6 +32,11 @@ set_property -dict {PACKAGE_PIN P20 IOSTANDARD LVCMOS33} [get_ports led_frame]
 set_property -dict {PACKAGE_PIN P21 IOSTANDARD LVCMOS33} [get_ports led_alive]
 
 ## ============================================
+## UART TX — Boot diagnostic output (115200 8N1)
+## ============================================
+set_property -dict {PACKAGE_PIN L17 IOSTANDARD LVCMOS33} [get_ports uart_tx]
+
+## ============================================
 ## SPI Drive strength and slew rate
 ## ============================================
 ## ST7789V3 SPI can handle fast edges; FAST slew for better signal integrity

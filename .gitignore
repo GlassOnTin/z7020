@@ -32,5 +32,8 @@ hailort.log
 .DS_Store
 Thumbs.db
 
+# U-Boot source tree (cloned, not tracked)
+u-boot/
+
 # Claude session files
 .claude/
