@@ -108,6 +108,7 @@ Then set the BOOT jumper to **QSPI** and power-cycle. See [Build & Program](docs
 | [Auto-Zoom](docs/auto-zoom.md) | Viewport control, zoom arithmetic, screensaver loop |
 | [Build & Program](docs/build-and-program.md) | Toolchain setup, pin mapping, build flow |
 | [Lessons Learned](docs/lessons-learned.md) | Pitfalls, debugging war stories, Vivado quirks |
+| [The Iteration Thesis](docs/iteration-thesis.md) | Fractal engines, recurrent hardware, and neural architecture |
 
 ## Project Structure
 
