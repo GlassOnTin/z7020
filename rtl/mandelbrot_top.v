@@ -21,7 +21,8 @@ module mandelbrot_top #(
     parameter H_RES     = 320,
     parameter V_RES     = 172,
     parameter PIX_COUNT = H_RES * V_RES,
-    parameter TEST_MODE = 0       // 0=normal, 1=solid color (iter=42), 2=gradient (iter=pixel_id[15:8])
+    parameter TEST_MODE    = 0,   // 0=normal, 1=solid color (iter=42), 2=gradient (iter=pixel_id[15:8])
+    parameter COMPUTE_MODE = 0    // 0=Mandelbrot (neuron_core), 1=MLP inference (mlp_core)
 )(
     input  wire        clk_50m,       // 50 MHz from PL crystal
     input  wire        rst_n_in,      // External reset (active low)
@@ -86,6 +87,20 @@ module mandelbrot_top #(
     localparam [ITER_W-1:0]       DEFAULT_MAX_ITER  = 256;
 
     // =========================================================
+    // MLP mode: normalized coordinate viewport [-1, +1]
+    // =========================================================
+    // x: -1.0 to +1.0 across 320 pixels → step = 2.0/320
+    // y: -1.0 to +1.0 across 172 pixels → step = 2.0/172
+    // In Q4.28:
+    //   -1.0 = 0xF0000000
+    //   2.0/320 = 0.00625 → 0.00625 * 2^28 = 1677721.6 ≈ 0x0019999A
+    //   2.0/172 = 0.011628 → 0.011628 * 2^28 = 3122165.9 ≈ 0x002FA0BE
+    localparam signed [WIDTH-1:0] MLP_CRE_START = 32'shF000_0000;  // -1.0
+    localparam signed [WIDTH-1:0] MLP_CIM_START = 32'shF000_0000;  // -1.0
+    localparam signed [WIDTH-1:0] MLP_CRE_STEP  = 32'sh0019_999A;  // 2.0/320
+    localparam signed [WIDTH-1:0] MLP_CIM_STEP  = 32'sh002F_A0BE;  // 2.0/172
+
+    // =========================================================
     // Wires between modules
     // =========================================================
 
@@ -119,8 +134,9 @@ module mandelbrot_top #(
     // Display frame done (from SPI driver — unused, compute free-runs)
     wire                     disp_frame_done;
 
-    // Auto-zoom viewport registers (declared here, driven by zoom controller below)
-    reg signed [WIDTH-1:0] zoom_step;
+    // Viewport registers (driven by zoom/MLP controller below)
+    reg signed [WIDTH-1:0] zoom_step;       // c_re step (and c_im step in Mandelbrot mode)
+    reg signed [WIDTH-1:0] zoom_cim_step;   // c_im step (separate for MLP mode aspect ratio)
     reg signed [WIDTH-1:0] zoom_cre_start;
     reg signed [WIDTH-1:0] zoom_cim_start;
     reg startup;
@@ -130,25 +146,45 @@ module mandelbrot_top #(
     // =========================================================
     generate
         if (TEST_MODE == 0) begin : gen_normal
-            // --- Production: neuron pool + scheduler ---
+            // --- Production: core pool + scheduler ---
             genvar i;
             for (i = 0; i < N_NEURONS; i = i + 1) begin : neurons
-                neuron_core #(
-                    .WIDTH(WIDTH), .FRAC(FRAC), .ITER_W(ITER_W)
-                ) u_neuron (
-                    .clk            (clk),
-                    .rst_n          (rst_n),
-                    .pixel_valid    (neuron_valid_w[i]),
-                    .pixel_ready    (neuron_ready_w[i]),
-                    .c_re           (neuron_c_re_w),
-                    .c_im           (neuron_c_im_w),
-                    .pixel_id       (neuron_pixel_id_w),
-                    .max_iter       (max_iter_w),
-                    .result_valid   (result_valid_w[i]),
-                    .result_pixel_id(result_pixel_id_w[i*16 +: 16]),
-                    .result_iter    (result_iter_w[i*ITER_W +: ITER_W]),
-                    .busy           ()
-                );
+                if (COMPUTE_MODE == 0) begin : gen_mandelbrot
+                    neuron_core #(
+                        .WIDTH(WIDTH), .FRAC(FRAC), .ITER_W(ITER_W)
+                    ) u_neuron (
+                        .clk            (clk),
+                        .rst_n          (rst_n),
+                        .pixel_valid    (neuron_valid_w[i]),
+                        .pixel_ready    (neuron_ready_w[i]),
+                        .c_re           (neuron_c_re_w),
+                        .c_im           (neuron_c_im_w),
+                        .pixel_id       (neuron_pixel_id_w),
+                        .max_iter       (max_iter_w),
+                        .result_valid   (result_valid_w[i]),
+                        .result_pixel_id(result_pixel_id_w[i*16 +: 16]),
+                        .result_iter    (result_iter_w[i*ITER_W +: ITER_W]),
+                        .busy           ()
+                    );
+                end else begin : gen_mlp
+                    mlp_core #(
+                        .WIDTH(WIDTH), .FRAC(FRAC), .ITER_W(ITER_W),
+                        .N_HIDDEN(16), .N_LAYERS(3)
+                    ) u_mlp (
+                        .clk            (clk),
+                        .rst_n          (rst_n),
+                        .pixel_valid    (neuron_valid_w[i]),
+                        .pixel_ready    (neuron_ready_w[i]),
+                        .c_re           (neuron_c_re_w),
+                        .c_im           (neuron_c_im_w),
+                        .pixel_id       (neuron_pixel_id_w),
+                        .max_iter       (max_iter_w),
+                        .result_valid   (result_valid_w[i]),
+                        .result_pixel_id(result_pixel_id_w[i*16 +: 16]),
+                        .result_iter    (result_iter_w[i*ITER_W +: ITER_W]),
+                        .busy           ()
+                    );
+                end
             end
 
             pixel_scheduler #(
@@ -163,7 +199,7 @@ module mandelbrot_top #(
                 .c_re_start     (zoom_cre_start),
                 .c_im_start     (zoom_cim_start),
                 .c_re_step      (zoom_step),
-                .c_im_step      (zoom_step),
+                .c_im_step      (zoom_cim_step),
                 .max_iter       (max_iter_w),
                 .neuron_valid   (neuron_valid_w),
                 .neuron_ready   (neuron_ready_w),
@@ -237,93 +273,108 @@ module mandelbrot_top #(
     endgenerate
 
     // =========================================================
-    // Iteration count framebuffer — double-buffered (BRAM)
-    // Compute writes to back buffer, display reads from front.
-    // Swap on frame_done so display always sees a complete frame.
+    // Framebuffer pipeline
+    // =========================================================
+    // COMPUTE_MODE == 0 (Mandelbrot):
+    //   iter_fb (double-buffered) → colormap → disp_fb → SPI
+    // COMPUTE_MODE == 1 (MLP):
+    //   scheduler result (RGB565) → disp_fb directly → SPI
+    //   (iter_fb and colormap bypassed)
     // =========================================================
     localparam FB_DEPTH = 65536;
     reg iter_buf_sel;  // 0: compute writes buf 0, display reads buf 1
                        // 1: compute writes buf 1, display reads buf 0
 
-    // Buffer 0
-    (* ram_style = "block" *) reg [ITER_W-1:0] iter_fb_0 [0:FB_DEPTH-1];
+    // --- Iteration framebuffer (Mandelbrot mode only) ---
+    generate if (COMPUTE_MODE == 0) begin : gen_iter_fb
+        // Buffer 0
+        (* ram_style = "block" *) reg [ITER_W-1:0] iter_fb_0 [0:FB_DEPTH-1];
 
-    always @(posedge clk) begin
-        if (fb_iter_wr_en && !iter_buf_sel)
-            iter_fb_0[fb_iter_wr_addr] <= fb_iter_wr_data;
-    end
+        always @(posedge clk) begin
+            if (fb_iter_wr_en && !iter_buf_sel)
+                iter_fb_0[fb_iter_wr_addr] <= fb_iter_wr_data;
+        end
 
-    reg [ITER_W-1:0] iter_fb_0_rd;
-    always @(posedge clk) begin
-        iter_fb_0_rd <= iter_fb_0[iter_fb_rd_addr];
-    end
+        reg [ITER_W-1:0] iter_fb_0_rd;
+        always @(posedge clk) begin
+            iter_fb_0_rd <= iter_fb_0[iter_fb_rd_addr];
+        end
 
-    // Buffer 1
-    (* ram_style = "block" *) reg [ITER_W-1:0] iter_fb_1 [0:FB_DEPTH-1];
+        // Buffer 1
+        (* ram_style = "block" *) reg [ITER_W-1:0] iter_fb_1 [0:FB_DEPTH-1];
 
-    always @(posedge clk) begin
-        if (fb_iter_wr_en && iter_buf_sel)
-            iter_fb_1[fb_iter_wr_addr] <= fb_iter_wr_data;
-    end
+        always @(posedge clk) begin
+            if (fb_iter_wr_en && iter_buf_sel)
+                iter_fb_1[fb_iter_wr_addr] <= fb_iter_wr_data;
+        end
 
-    reg [ITER_W-1:0] iter_fb_1_rd;
-    always @(posedge clk) begin
-        iter_fb_1_rd <= iter_fb_1[iter_fb_rd_addr];
-    end
+        reg [ITER_W-1:0] iter_fb_1_rd;
+        always @(posedge clk) begin
+            iter_fb_1_rd <= iter_fb_1[iter_fb_rd_addr];
+        end
 
-    // Front-buffer read mux (display reads opposite of write buffer)
-    reg [ITER_W-1:0] iter_fb_rd;
-    reg [15:0]       iter_fb_rd_addr;
+        // Front-buffer read mux
+        reg [ITER_W-1:0] iter_fb_rd;
+        reg [15:0]       iter_fb_rd_addr;
 
-    always @(posedge clk) begin
-        iter_fb_rd_addr <= fb_disp_addr;
-    end
+        always @(posedge clk) begin
+            iter_fb_rd_addr <= fb_disp_addr;
+        end
 
-    always @(*) begin
-        iter_fb_rd = iter_buf_sel ? iter_fb_0_rd : iter_fb_1_rd;
-    end
+        always @(*) begin
+            iter_fb_rd = iter_buf_sel ? iter_fb_0_rd : iter_fb_1_rd;
+        end
+    end endgenerate
 
-    // =========================================================
-    // Colormap: iteration count → RGB565
-    // =========================================================
+    // --- Colormap (Mandelbrot mode only) ---
     wire [15:0] color_rgb565;
     wire        color_valid;
 
-    colormap_lut #(.ITER_W(ITER_W)) u_colormap (
-        .clk        (clk),
-        .iter_count (iter_fb_rd),
-        .max_iter   (max_iter_w),
-        .valid_in   (1'b1),         // Always valid (continuous read)
-        .rgb565     (color_rgb565),
-        .valid_out  (color_valid)
-    );
+    generate if (COMPUTE_MODE == 0) begin : gen_colormap
+        colormap_lut #(.ITER_W(ITER_W)) u_colormap (
+            .clk        (clk),
+            .iter_count (gen_iter_fb.iter_fb_rd),
+            .max_iter   (max_iter_w),
+            .valid_in   (1'b1),
+            .rgb565     (color_rgb565),
+            .valid_out  (color_valid)
+        );
+    end else begin : gen_no_colormap
+        assign color_rgb565 = 16'h0000;
+        assign color_valid  = 1'b0;
+    end endgenerate
 
     // =========================================================
     // Display framebuffer — single buffer (BRAM, dual-port)
-    // Port A: Write from inline colormap (SPI scan drives iter_fb
-    //         reads through colormap, results written here)
-    // Port B: Read from SPI driver
     // =========================================================
-
-    // Colormap write pipeline: delay address to match iter_fb read + colormap latency (2 cycles)
-    reg [15:0] color_wr_addr;
-    reg [15:0] color_wr_addr_d;
-
-    always @(posedge clk) begin
-        color_wr_addr   <= iter_fb_rd_addr;
-        color_wr_addr_d <= color_wr_addr;
-    end
-
     (* ram_style = "block" *) reg [15:0] disp_fb [0:FB_DEPTH-1];
     reg [15:0] disp_fb_rd;
 
-    // Port A: Write from colormap (continuous — SPI scan drives updates)
-    always @(posedge clk) begin
-        if (color_valid)
-            disp_fb[color_wr_addr_d] <= color_rgb565;
-    end
+    generate if (COMPUTE_MODE == 0) begin : gen_disp_wr_mandelbrot
+        // Colormap write pipeline: delay address to match iter_fb read + colormap latency
+        reg [15:0] color_wr_addr;
+        reg [15:0] color_wr_addr_d;
 
-    // Port B: Read for SPI driver
+        always @(posedge clk) begin
+            color_wr_addr   <= gen_iter_fb.iter_fb_rd_addr;
+            color_wr_addr_d <= color_wr_addr;
+        end
+
+        // Port A: Write from colormap
+        always @(posedge clk) begin
+            if (color_valid)
+                disp_fb[color_wr_addr_d] <= color_rgb565;
+        end
+    end else begin : gen_disp_wr_mlp
+        // MLP mode: scheduler result carries RGB565 directly
+        // Write to disp_fb on the same signal the scheduler uses
+        always @(posedge clk) begin
+            if (fb_iter_wr_en)
+                disp_fb[fb_iter_wr_addr] <= fb_iter_wr_data;
+        end
+    end endgenerate
+
+    // Port B: Read for SPI driver (shared between modes)
     always @(posedge clk) begin
         disp_fb_rd <= disp_fb[fb_disp_addr];
     end
@@ -349,66 +400,92 @@ module mandelbrot_top #(
     );
 
     // =========================================================
-    // Auto-zoom controller (compute free-runs, decoupled from display)
+    // Frame controller
     // =========================================================
-    // Zoom target: seahorse valley (-0.745, +0.113)
-    localparam signed [WIDTH-1:0] TARGET_RE = 32'shF414_7AE1;  // -0.745 in Q4.28
-    localparam signed [WIDTH-1:0] TARGET_IM = 32'sh01CF_DF3B;  // +0.113 in Q4.28
+    // COMPUTE_MODE==0: Auto-zoom into seahorse valley (Mandelbrot)
+    // COMPUTE_MODE==1: Fixed viewport, incrementing time (MLP/SIREN)
 
-    // Next step value after zoom
-    wire signed [WIDTH-1:0] next_step = zoom_step - (zoom_step >>> 6);  // × 63/64 ≈ 0.984
+    generate if (COMPUTE_MODE == 0) begin : gen_zoom_ctrl
+        // --- Mandelbrot zoom controller ---
+        localparam signed [WIDTH-1:0] TARGET_RE = 32'shF414_7AE1;  // -0.745
+        localparam signed [WIDTH-1:0] TARGET_IM = 32'sh01CF_DF3B;  // +0.113
 
-    // Compute viewport start from next_step:
-    //   start_re = TARGET_RE - 160 * next_step   (160 = 128 + 32)
-    //   start_im = TARGET_IM -  86 * next_step   ( 86 =  64 + 16 + 4 + 2)
-    wire signed [WIDTH-1:0] half_h = (next_step <<< 7) + (next_step <<< 5);          // 160 * step
-    wire signed [WIDTH-1:0] half_v = (next_step <<< 6) + (next_step <<< 4)
-                                   + (next_step <<< 2) + (next_step <<< 1);          //  86 * step
+        wire signed [WIDTH-1:0] next_step = zoom_step - (zoom_step >>> 6);
+        wire signed [WIDTH-1:0] half_h = (next_step <<< 7) + (next_step <<< 5);
+        wire signed [WIDTH-1:0] half_v = (next_step <<< 6) + (next_step <<< 4)
+                                       + (next_step <<< 2) + (next_step <<< 1);
 
-    // Compute done → update zoom and start next frame immediately
-    // (no waiting for display — compute free-runs at ~91 FPS)
+        always @(posedge clk or negedge rst_n) begin
+            if (!rst_n) begin
+                frame_start_r  <= 0;
+                startup        <= 1;
+                zoom_step      <= DEFAULT_CRE_STEP;
+                zoom_cim_step  <= DEFAULT_CIM_STEP;
+                zoom_cre_start <= DEFAULT_CRE_START;
+                zoom_cim_start <= DEFAULT_CIM_START;
+                max_iter_w     <= DEFAULT_MAX_ITER;
+                iter_buf_sel   <= 0;
+            end else begin
+                frame_start_r <= 0;
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            frame_start_r  <= 0;
-            startup        <= 1;
-            zoom_step      <= DEFAULT_CRE_STEP;
-            zoom_cre_start <= DEFAULT_CRE_START;
-            zoom_cim_start <= DEFAULT_CIM_START;
-            max_iter_w     <= DEFAULT_MAX_ITER;
-            iter_buf_sel   <= 0;
-        end else begin
-            frame_start_r <= 0;
-
-            // Start first frame after reset
-            if (startup) begin
-                frame_start_r <= 1;
-                startup       <= 0;
-            end
-
-            // Compute done → swap iter buffers, zoom, start next frame
-            if (frame_done_w && !frame_busy_w) begin
-                iter_buf_sel <= ~iter_buf_sel;
-                if (next_step == zoom_step) begin
-                    // Precision exhausted (step >>> 6 rounds to 0) — loop back
-                    zoom_step      <= DEFAULT_CRE_STEP;
-                    zoom_cre_start <= DEFAULT_CRE_START;
-                    zoom_cim_start <= DEFAULT_CIM_START;
-                    max_iter_w     <= DEFAULT_MAX_ITER;
-                end else begin
-                    // Shrink step by factor 63/64 ≈ 0.984
-                    zoom_step      <= next_step;
-                    // Recompute viewport origin from new step
-                    zoom_cre_start <= TARGET_RE - half_h;
-                    zoom_cim_start <= TARGET_IM - half_v;
-                    // Ramp up max_iter (more detail as we zoom in)
-                    if (max_iter_w < 1024)
-                        max_iter_w <= max_iter_w + 1;
+                if (startup) begin
+                    frame_start_r <= 1;
+                    startup       <= 0;
                 end
-                frame_start_r <= 1;
+
+                if (frame_done_w && !frame_busy_w) begin
+                    iter_buf_sel <= ~iter_buf_sel;
+                    if (next_step == zoom_step) begin
+                        zoom_step      <= DEFAULT_CRE_STEP;
+                        zoom_cim_step  <= DEFAULT_CIM_STEP;
+                        zoom_cre_start <= DEFAULT_CRE_START;
+                        zoom_cim_start <= DEFAULT_CIM_START;
+                        max_iter_w     <= DEFAULT_MAX_ITER;
+                    end else begin
+                        zoom_step      <= next_step;
+                        zoom_cim_step  <= next_step;
+                        zoom_cre_start <= TARGET_RE - half_h;
+                        zoom_cim_start <= TARGET_IM - half_v;
+                        if (max_iter_w < 1024)
+                            max_iter_w <= max_iter_w + 1;
+                    end
+                    frame_start_r <= 1;
+                end
             end
         end
-    end
+
+    end else begin : gen_mlp_ctrl
+        // --- MLP time-stepping controller ---
+        // Fixed viewport [-1,+1], max_iter increments as time parameter
+        always @(posedge clk or negedge rst_n) begin
+            if (!rst_n) begin
+                frame_start_r  <= 0;
+                startup        <= 1;
+                zoom_step      <= MLP_CRE_STEP;
+                zoom_cim_step  <= MLP_CIM_STEP;
+                zoom_cre_start <= MLP_CRE_START;
+                zoom_cim_start <= MLP_CIM_START;
+                max_iter_w     <= 0;
+                iter_buf_sel   <= 0;
+            end else begin
+                frame_start_r <= 0;
+
+                if (startup) begin
+                    frame_start_r <= 1;
+                    startup       <= 0;
+                end
+
+                if (frame_done_w && !frame_busy_w) begin
+                    // No buffer swap needed in MLP mode (direct disp_fb write)
+                    // but keep toggling for scheduler compatibility
+                    iter_buf_sel <= ~iter_buf_sel;
+                    // Increment time each frame (wraps at 65535)
+                    max_iter_w <= max_iter_w + 1;
+                    frame_start_r <= 1;
+                end
+            end
+        end
+    end endgenerate
 
     // =========================================================
     // LED1 — toggles each compute frame (shows zoom progress)
