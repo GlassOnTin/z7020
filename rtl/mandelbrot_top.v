@@ -116,17 +116,8 @@ module mandelbrot_top #(
     wire [15:0]              fb_disp_addr;
     wire [15:0]              fb_disp_data;
 
-    // Display frame done
+    // Display frame done (from SPI driver — unused, compute free-runs)
     wire                     disp_frame_done;
-
-    // Double-buffer control
-    reg                      disp_buf_sel;    // 0 = SPI reads A, 1 = SPI reads B
-    reg                      swap_pending;    // Set when sweep done, cleared on swap
-
-    // Color sweep state
-    reg                      sweeping;
-    reg [15:0]               sweep_addr;
-    reg                      sweep_done;
 
     // Auto-zoom viewport registers (declared here, driven by zoom controller below)
     reg signed [WIDTH-1:0] zoom_step;
@@ -246,27 +237,50 @@ module mandelbrot_top #(
     endgenerate
 
     // =========================================================
-    // Iteration count framebuffer (BRAM, dual-port)
-    // Port A: Write from scheduler (iteration counts)
-    // Port B: Read for colormap → display
+    // Iteration count framebuffer — double-buffered (BRAM)
+    // Compute writes to back buffer, display reads from front.
+    // Swap on frame_done so display always sees a complete frame.
     // =========================================================
-    // Framebuffers use 2^16 depth for clean BRAM inference (only 55040 used)
     localparam FB_DEPTH = 65536;
-    (* ram_style = "block" *) reg [ITER_W-1:0] iter_fb [0:FB_DEPTH-1];
+    reg iter_buf_sel;  // 0: compute writes buf 0, display reads buf 1
+                       // 1: compute writes buf 1, display reads buf 0
 
-    // Port A: write
+    // Buffer 0
+    (* ram_style = "block" *) reg [ITER_W-1:0] iter_fb_0 [0:FB_DEPTH-1];
+
     always @(posedge clk) begin
-        if (fb_iter_wr_en)
-            iter_fb[fb_iter_wr_addr] <= fb_iter_wr_data;
+        if (fb_iter_wr_en && !iter_buf_sel)
+            iter_fb_0[fb_iter_wr_addr] <= fb_iter_wr_data;
     end
 
-    // Port B: read (addressed by display driver or sweep)
+    reg [ITER_W-1:0] iter_fb_0_rd;
+    always @(posedge clk) begin
+        iter_fb_0_rd <= iter_fb_0[iter_fb_rd_addr];
+    end
+
+    // Buffer 1
+    (* ram_style = "block" *) reg [ITER_W-1:0] iter_fb_1 [0:FB_DEPTH-1];
+
+    always @(posedge clk) begin
+        if (fb_iter_wr_en && iter_buf_sel)
+            iter_fb_1[fb_iter_wr_addr] <= fb_iter_wr_data;
+    end
+
+    reg [ITER_W-1:0] iter_fb_1_rd;
+    always @(posedge clk) begin
+        iter_fb_1_rd <= iter_fb_1[iter_fb_rd_addr];
+    end
+
+    // Front-buffer read mux (display reads opposite of write buffer)
     reg [ITER_W-1:0] iter_fb_rd;
     reg [15:0]       iter_fb_rd_addr;
 
     always @(posedge clk) begin
-        iter_fb_rd_addr <= sweeping ? sweep_addr : fb_disp_addr;
-        iter_fb_rd      <= iter_fb[iter_fb_rd_addr];
+        iter_fb_rd_addr <= fb_disp_addr;
+    end
+
+    always @(*) begin
+        iter_fb_rd = iter_buf_sel ? iter_fb_0_rd : iter_fb_1_rd;
     end
 
     // =========================================================
@@ -285,70 +299,33 @@ module mandelbrot_top #(
     );
 
     // =========================================================
-    // Display framebuffer — double-buffered (BRAM, dual-port)
-    // Each buffer has its own always block for clean BRAM inference.
-    // Port A: Write from colormap sweep (to back buffer)
-    // Port B: Read from SPI driver (from front buffer)
+    // Display framebuffer — single buffer (BRAM, dual-port)
+    // Port A: Write from inline colormap (SPI scan drives iter_fb
+    //         reads through colormap, results written here)
+    // Port B: Read from SPI driver
     // =========================================================
 
     // Colormap write pipeline: delay address to match iter_fb read + colormap latency (2 cycles)
     reg [15:0] color_wr_addr;
     reg [15:0] color_wr_addr_d;
 
-    // Delay sweeping by 2 cycles to match the address pipeline latency.
-    // Without this, the first 2 writes after sweep start go to stale
-    // display-path addresses instead of sweep addresses.
-    reg        sweep_wr_v0, sweep_wr_v1;
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            sweep_wr_v0 <= 0;
-            sweep_wr_v1 <= 0;
-        end else begin
-            sweep_wr_v0 <= sweeping;
-            sweep_wr_v1 <= sweep_wr_v0;
-        end
-    end
-    wire       color_wr_en = color_valid & sweep_wr_v1;
-
     always @(posedge clk) begin
         color_wr_addr   <= iter_fb_rd_addr;
         color_wr_addr_d <= color_wr_addr;
     end
 
-    // Back-buffer write enables (one-hot, never both)
-    wire wr_en_a = color_wr_en &  disp_buf_sel;  // buf_sel=1 → SPI reads B, write to A
-    wire wr_en_b = color_wr_en & ~disp_buf_sel;  // buf_sel=0 → SPI reads A, write to B
-
-    // Buffer A — dedicated write and read ports
-    (* ram_style = "block" *) reg [15:0] disp_fb_a [0:FB_DEPTH-1];
-    reg [15:0] disp_fb_a_rd;
-
-    always @(posedge clk) begin
-        if (wr_en_a)
-            disp_fb_a[color_wr_addr_d] <= color_rgb565;
-    end
-
-    always @(posedge clk) begin
-        disp_fb_a_rd <= disp_fb_a[fb_disp_addr];
-    end
-
-    // Buffer B — dedicated write and read ports
-    (* ram_style = "block" *) reg [15:0] disp_fb_b [0:FB_DEPTH-1];
-    reg [15:0] disp_fb_b_rd;
-
-    always @(posedge clk) begin
-        if (wr_en_b)
-            disp_fb_b[color_wr_addr_d] <= color_rgb565;
-    end
-
-    always @(posedge clk) begin
-        disp_fb_b_rd <= disp_fb_b[fb_disp_addr];
-    end
-
-    // Front-buffer read mux (after BRAM output registers)
+    (* ram_style = "block" *) reg [15:0] disp_fb [0:FB_DEPTH-1];
     reg [15:0] disp_fb_rd;
-    always @(*) begin
-        disp_fb_rd = disp_buf_sel ? disp_fb_b_rd : disp_fb_a_rd;
+
+    // Port A: Write from colormap (continuous — SPI scan drives updates)
+    always @(posedge clk) begin
+        if (color_valid)
+            disp_fb[color_wr_addr_d] <= color_rgb565;
+    end
+
+    // Port B: Read for SPI driver
+    always @(posedge clk) begin
+        disp_fb_rd <= disp_fb[fb_disp_addr];
     end
 
     // =========================================================
@@ -371,44 +348,8 @@ module mandelbrot_top #(
         .frame_done (disp_frame_done)
     );
 
-    // iter_fb_rd_addr is now driven by the sweep/display mux in the iter_fb read block above
-
     // =========================================================
-    // Color sweep state machine
-    // =========================================================
-    // After compute completes, sweep reads iter_fb[0..PIX_COUNT-1]
-    // through the colormap and writes results into the back disp_fb.
-    // Pipeline: cycle N: set sweep_addr → N+1: iter_fb_rd valid →
-    //           N+2: color_rgb565 valid → write to back buffer.
-    // sweep_addr counts 0 to PIX_COUNT-1, then 2 extra flush cycles.
-
-    localparam [15:0] SWEEP_END = PIX_COUNT[15:0] + 16'd1;  // +1 flush (sweep_wr_v1 delay provides 2 extra write cycles)
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            sweeping   <= 0;
-            sweep_addr <= 0;
-            sweep_done <= 0;
-        end else begin
-            sweep_done <= 0;
-
-            if (frame_done_w && !frame_busy_w && !sweeping) begin
-                // Compute done — start sweep
-                sweeping   <= 1;
-                sweep_addr <= 0;
-            end else if (sweeping) begin
-                if (sweep_addr == SWEEP_END - 1) begin
-                    sweeping   <= 0;
-                    sweep_done <= 1;
-                end else begin
-                    sweep_addr <= sweep_addr + 1;
-                end
-            end
-        end
-    end
-
-    // =========================================================
-    // Auto-zoom controller with double-buffer swap
+    // Auto-zoom controller (compute free-runs, decoupled from display)
     // =========================================================
     // Zoom target: seahorse valley (-0.745, +0.113)
     localparam signed [WIDTH-1:0] TARGET_RE = 32'shF414_7AE1;  // -0.745 in Q4.28
@@ -424,10 +365,8 @@ module mandelbrot_top #(
     wire signed [WIDTH-1:0] half_v = (next_step <<< 6) + (next_step <<< 4)
                                    + (next_step <<< 2) + (next_step <<< 1);          //  86 * step
 
-    // Frame sequencing:
-    //   frame_done_w → sweep iter_fb through colormap into back buffer (~1.1ms)
-    //   sweep_done → set swap_pending
-    //   disp_frame_done && swap_pending → swap buffers + zoom + frame_start
+    // Compute done → update zoom and start next frame immediately
+    // (no waiting for display — compute free-runs at ~91 FPS)
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -437,8 +376,7 @@ module mandelbrot_top #(
             zoom_cre_start <= DEFAULT_CRE_START;
             zoom_cim_start <= DEFAULT_CIM_START;
             max_iter_w     <= DEFAULT_MAX_ITER;
-            disp_buf_sel   <= 0;
-            swap_pending   <= 0;
+            iter_buf_sel   <= 0;
         end else begin
             frame_start_r <= 0;
 
@@ -448,15 +386,9 @@ module mandelbrot_top #(
                 startup       <= 0;
             end
 
-            // Sweep done → arm buffer swap
-            if (sweep_done)
-                swap_pending <= 1;
-
-            // SPI frame boundary + swap pending → swap buffers and start next compute
-            if (disp_frame_done && swap_pending) begin
-                disp_buf_sel <= ~disp_buf_sel;
-                swap_pending <= 0;
-
+            // Compute done → swap iter buffers, zoom, start next frame
+            if (frame_done_w && !frame_busy_w) begin
+                iter_buf_sel <= ~iter_buf_sel;
                 if (next_step == zoom_step) begin
                     // Precision exhausted (step >>> 6 rounds to 0) — loop back
                     zoom_step      <= DEFAULT_CRE_STEP;
