@@ -591,6 +591,193 @@ def target_float_glass(x, y, t):
     return np.stack([r_out, g_out, b_out], axis=-1)
 
 
+def _solve_combustion(nx=128, ny=128, nt=6000):
+    """Solve buoyant combustion (reactive Boussinesq) on a 2D domain.
+
+    Coupled system:
+        dT/dt + u·∇T = kT ∇²T + Q·R(T,Y)     (temperature)
+        dY/dt + u·∇Y = kY ∇²Y - R(T,Y)         (fuel mass fraction)
+        dw/dt + u·∇w = nu ∇²w + alpha·dT/dx2    (vorticity, buoyancy)
+        ∇²psi = -w                                (stream function)
+        u = dpsi/dy, v = -dpsi/dx                 (velocity)
+
+    R(T,Y) = Da·Y·exp(-Ea/(T+T0)) is Arrhenius reaction rate.
+    Buoyancy drives the plume upward (hot gas is lighter).
+
+    Returns (T, Y, w) arrays of shape (nx, ny, n_snapshots).
+    """
+    dx = 2.0 / (nx - 1)
+    dy = 2.0 / (ny - 1)
+
+    # Physical parameters (non-dimensional, tuned for visual interest)
+    kT = 0.006       # thermal diffusivity
+    kY = 0.003       # fuel diffusivity
+    nu = 0.005       # viscosity (higher for stability)
+    alpha = 2.5      # buoyancy strength
+    Q = 2.0          # heat release
+    Da = 5.0         # Damköhler number (reaction speed)
+    Ea = 2.5         # activation energy
+    T0 = 1.0         # reference temperature offset
+
+    x = np.linspace(-1, 1, nx)
+    y = np.linspace(-1, 1, ny)
+    xx, yy = np.meshgrid(x, y, indexing='ij')
+
+    # Initial fields
+    T = np.zeros((nx, ny))       # temperature (ambient = 0)
+    Y = np.zeros((nx, ny))       # fuel fraction (no fuel initially)
+    w = np.zeros((nx, ny))       # vorticity
+    psi = np.zeros((nx, ny))     # stream function
+
+    # Fuel source: burner at bottom center
+    burner_mask = np.exp(-20 * ((xx)**2 + (yy + 0.8)**2))
+    # Small hot seed to ignite
+    T += 0.5 * np.exp(-30 * (xx**2 + (yy + 0.7)**2))
+
+    dt_diff = 0.1 * dx**2 / max(kT, kY, nu)  # diffusive CFL
+    dt = dt_diff
+
+    n_snap = 64
+    save_every = max(1, nt // n_snap)
+    snaps_T = []
+    snaps_Y = []
+    snaps_w = []
+
+    rng = np.random.RandomState(42)
+
+    for step in range(nt):
+        if step % save_every == 0:
+            snaps_T.append(T.copy())
+            snaps_Y.append(Y.copy())
+            snaps_w.append(w.copy())
+
+        # Solve Poisson for stream function: ∇²psi = -w
+        # Simple Jacobi iteration (20 iterations, good enough for visual quality)
+        for _ in range(20):
+            psi[1:-1,1:-1] = 0.25 * (
+                psi[2:,1:-1] + psi[:-2,1:-1] +
+                psi[1:-1,2:] + psi[1:-1,:-2] +
+                dx**2 * w[1:-1,1:-1])
+            # psi = 0 on all boundaries (no-flow)
+            psi[0,:] = 0; psi[-1,:] = 0
+            psi[:,0] = 0; psi[:,-1] = 0
+
+        # Velocity from stream function
+        u_vel = np.zeros_like(psi)
+        v_vel = np.zeros_like(psi)
+        u_vel[1:-1,1:-1] = (psi[1:-1,2:] - psi[1:-1,:-2]) / (2*dy)
+        v_vel[1:-1,1:-1] = -(psi[2:,1:-1] - psi[:-2,1:-1]) / (2*dx)
+
+        # Laplacians
+        def lap(f):
+            L = np.zeros_like(f)
+            L[1:-1,1:-1] = (f[2:,1:-1] + f[:-2,1:-1] +
+                            f[1:-1,2:] + f[1:-1,:-2] - 4*f[1:-1,1:-1]) / dx**2
+            return L
+
+        # Advection (upwind, 1st order for stability)
+        def advect(f, u, v):
+            A = np.zeros_like(f)
+            # x-direction
+            A[1:-1,1:-1] += np.where(u[1:-1,1:-1] > 0,
+                u[1:-1,1:-1] * (f[1:-1,1:-1] - f[:-2,1:-1]) / dx,
+                u[1:-1,1:-1] * (f[2:,1:-1] - f[1:-1,1:-1]) / dx)
+            # y-direction
+            A[1:-1,1:-1] += np.where(v[1:-1,1:-1] > 0,
+                v[1:-1,1:-1] * (f[1:-1,1:-1] - f[1:-1,:-2]) / dy,
+                v[1:-1,1:-1] * (f[1:-1,2:] - f[1:-1,1:-1]) / dy)
+            return A
+
+        # Reaction rate: Arrhenius
+        R = Da * Y * np.exp(-Ea / (T + T0))
+        R = np.clip(R, 0, 10)  # stability cap
+
+        # Buoyancy: horizontal temperature gradient drives vorticity
+        dTdx = np.zeros_like(T)
+        dTdx[1:-1,1:-1] = (T[2:,1:-1] - T[:-2,1:-1]) / (2*dx)
+
+        # Adaptive CFL: limit dt by max velocity
+        u_max = max(np.abs(u_vel).max(), np.abs(v_vel).max(), 0.01)
+        dt_adv = 0.3 * dx / u_max
+        dt = min(dt_diff, dt_adv)
+
+        # Time integration
+        T += dt * (-advect(T, u_vel, v_vel) + kT * lap(T) + Q * R)
+        Y += dt * (-advect(Y, u_vel, v_vel) + kY * lap(Y) - R)
+        w += dt * (-advect(w, u_vel, v_vel) + nu * lap(w) + alpha * dTdx)
+
+        # Fuel injection from burner
+        Y += dt * 1.5 * burner_mask
+
+        # Small perturbation for flame flickering
+        if step % 80 == 0:
+            T += 0.015 * rng.randn(nx, ny) * burner_mask
+
+        # Clamp (aggressive — prevents blowup)
+        T = np.clip(T, 0, 4)
+        Y = np.clip(Y, 0, 1)
+        w = np.clip(w, -20, 20)
+
+        # NaN check — reset if blowup
+        if np.any(np.isnan(T)):
+            T = np.nan_to_num(T, nan=0.0)
+            Y = np.nan_to_num(Y, nan=0.0)
+            w = np.nan_to_num(w, nan=0.0)
+            psi = np.nan_to_num(psi, nan=0.0)
+
+        # Boundary conditions
+        T[:, 0] = T[:, 1] * 0.3   # cool floor
+        Y[:, 0] = Y[:, 1]
+        w[:, 0] = w[:, 1]
+        T[:,-1] = T[:,-2] * 0.8   # slight cooling at top
+        Y[:,-1] = Y[:,-2]
+        w[:,-1] = 0                # no vorticity at outflow
+        T[0,:] = T[1,:]; T[-1,:] = T[-2,:]
+        Y[0,:] = Y[1,:]; Y[-1,:] = Y[-2,:]
+        w[0,:] = 0; w[-1,:] = 0
+
+        # Damping (prevents energy accumulation)
+        T *= 0.9997
+        w *= 0.999
+
+    return (np.stack(snaps_T, axis=-1),
+            np.stack(snaps_Y, axis=-1),
+            np.stack(snaps_w, axis=-1))
+
+
+def target_combustion(x, y, t):
+    """Buoyant combustion plume — reactive Boussinesq flow.
+
+    Coupled temperature-fuel-vorticity system with Arrhenius kinetics.
+    A burner at the bottom injects fuel which ignites, producing a
+    buoyant plume that rises, rolls up into vortices, and flickers.
+
+    The coupling between buoyancy, reaction, and vortex dynamics
+    creates chaotic flame-like patterns with no analytical solution.
+    """
+    if not hasattr(target_combustion, '_cache'):
+        print("    Solving buoyant combustion equations (this takes a moment)...")
+        target_combustion._cache = _solve_combustion()
+        print("    Simulation complete.")
+
+    snaps_T, snaps_Y, snaps_w = target_combustion._cache
+    t_max = 8.0  # matches FPGA time_val range [0, 8.0)
+
+    T = _interp_field(snaps_T, x, y, t, t_max)
+    Y = _interp_field(snaps_Y, x, y, t, t_max)
+
+    # Fire colormap: black → red → orange → yellow → white
+    T_norm = np.clip(T / 3.0, 0, 1)    # normalize temperature
+    Y_norm = np.clip(Y * 3.0, 0, 1)    # fuel presence
+
+    # Blackbody-like fire colors
+    r_out = np.clip(T_norm * 3.0 - 0.5, -1, 1)                     # red: early onset
+    g_out = np.clip(T_norm * 2.5 - 1.0, -1, 1)                     # green: mid temperature
+    b_out = np.clip(T_norm * 2.0 - 1.5 + Y_norm * 0.4, -1, 1)     # blue: only very hot + fuel
+
+    return np.stack([r_out, g_out, b_out], axis=-1)
+
+
 PATTERNS = {
     'lava_lamp': target_lava_lamp,
     'reaction_diffusion': target_reaction_diffusion,
@@ -599,6 +786,7 @@ PATTERNS = {
     'shallow_water': target_shallow_water,
     'gray_scott': target_gray_scott,
     'float_glass': target_float_glass,
+    'combustion': target_combustion,
 }
 
 
