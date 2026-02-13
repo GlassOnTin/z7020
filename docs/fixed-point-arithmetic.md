@@ -135,6 +135,62 @@ In practice, the auto-zoom controller detects precision exhaustion when `step - 
 
 To zoom deeper, the design could be extended to Q4.60 (64-bit) at the cost of more DSPs per multiply (a 64×64 multiply requires ~16 DSP48E1 slices), or a multi-precision iterative approach could be used.
 
+## Fixed-Point to RGB565 Conversion (MLP Mode)
+
+In MLP mode, the neural network outputs three Q4.28 values in [-1, +1] representing R, G, B. These must be converted to 16-bit RGB565 (5 red, 6 green, 5 blue bits).
+
+### The mapping
+
+```
+Step 1: Shift [-1, +1] → [0, 2) by adding 1.0 (0x10000000)
+Step 2: Clamp negatives to 0, values ≥ 2.0 to max
+Step 3: Extract bits for each channel
+```
+
+### Bit positions in Q4.28
+
+For a value in [0, 2.0):
+
+```
+Bit:  31 30 29 28 27 26 25 24 23 22 21 ...
+       S  I  I  I  F  F  F  F  F  F  F ...
+       │     │  │  └──────────────────── fractional part
+       │     │  └──────────────────────── 1.0 position (2⁰)
+       │     └─────────────────────────── 2.0 position (2¹)
+       └───────────────────────────────── sign
+```
+
+Key insight: **bit 28 is the 1.0 position**. A value of 1.0 is `0x10000000`, which has only bit 28 set. The entire [0, 2) range is encoded in bits [28:0].
+
+### Correct extraction
+
+To map [0, 2.0) → [0, 31] (5 bits for R/B): extract bits **[28:24]**
+
+```
+Value  Hex          Bits[28:24]  Decimal
+0.0    0x00000000   00000        0
+0.5    0x08000000   01000        8
+1.0    0x10000000   10000        16
+1.5    0x18000000   11000        24
+2.0    (clamped)    11111        31
+```
+
+For 6-bit green: bits **[28:23]**, giving 0-63.
+
+### The off-by-one trap
+
+Extracting `[27:23]` instead of `[28:24]` misses the 1.0 position bit. The mapping wraps at 1.0:
+
+```
+Value  Bits[27:23]  Decimal   Should be
+0.0    00000        0         0       ✓
+0.5    01000        8         8       ✓
+1.0    00000        0         16      ✗ ← wraps!
+1.5    01000        8         24      ✗
+```
+
+This creates a sawtooth: [0, 1) maps to 0-15, [1, 2) maps back to 0-15. Combined across R/G/B, this produces binary-looking color bands. See [lessons-learned.md](lessons-learned.md) Bug #9 for the full debugging story.
+
 ## Escape Threshold
 
 The standard escape condition |z|² > 4 uses the Q4.28 representation of 4.0:

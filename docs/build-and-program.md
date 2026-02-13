@@ -126,10 +126,15 @@ sudo usbipd -D                         # Start USB/IP daemon
 ### One-Step Build
 
 ```bash
-ssh msi-z790 "cd /path/to/z7020 && \
-    source env.sh && \
-    vivado -mode batch -source vivado/run_all.tcl > vivado/build.log 2>&1"
+# Mandelbrot mode (default)
+source env.sh
+vivado -mode batch -source vivado/run_all.tcl
+
+# MLP neural inference mode
+vivado -mode batch -source vivado/run_all.tcl -tclargs 1
 ```
+
+The `-tclargs 1` passes `COMPUTE_MODE=1` to the build script, which selects `mlp_core` instead of `neuron_core` in the generate block. Without this argument, the build defaults to Mandelbrot mode (`COMPUTE_MODE=0`).
 
 `run_all.tcl` executes the complete flow:
 

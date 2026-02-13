@@ -176,6 +176,146 @@ wire [8:0] cur_init_val = init_rom(init_idx);
 spi_dc <= cur_init_val[8];
 ```
 
+## 9. RGB565 Bit Extraction Off-By-One (The MLP Color Bug)
+
+### Symptom
+The neural network display showed pure color bands — solid red, green, blue, cyan, yellow, magenta — instead of smooth gradients. Colors appeared to be from the set {0, max} for each channel, as if the output was binary. This persisted through multiple "fix" attempts.
+
+### Root Cause
+The `pack_rgb565` function extracted the wrong bits from the Q4.28 shifted value. The code was:
+
+```verilog
+// WRONG: misses bit 28
+r5 = rs[27:23];   // For 5-bit R channel
+g6 = gs[27:22];   // For 6-bit G channel
+b5 = bs[27:23];   // For 5-bit B channel
+```
+
+The input to pack_rgb565 is a Q4.28 value shifted from [-1,+1] to [0,+2) by adding 1.0 (`0x10000000`). In Q4.28, **bit 28 is the 1.0 position** — the most significant bit of the [0, 2) range. By extracting `[27:23]` instead of `[28:24]`, the function ignored bit 28 entirely.
+
+This caused a sawtooth mapping:
+
+| sin() output | Shifted value | Correct (bits 28:24) | Wrong (bits 27:23) |
+|-------------|---------------|---------------------|--------------------|
+| -1.0 | 0.0 (0x00000000) | 00000 = 0 | 00000 = 0 |
+| -0.5 | 0.5 (0x08000000) | 01000 = 8 | 01000 = 8 |
+| 0.0 | 1.0 (0x10000000) | **10000 = 16** | **00000 = 0** |
+| +0.5 | 1.5 (0x18000000) | 11000 = 24 | 01000 = 8 |
+| +1.0 | 2.0 → clamped to 31 | 31 | 31 |
+
+At sin=0, the wrong extraction wraps from 15 back to 0. Values near zero (the most common sin() output) produced either very dark or very bright pixels, with nothing in between. Combined across R, G, B channels, this created the binary color band appearance.
+
+### Fix
+
+```verilog
+// CORRECT: bit 28 is the 1.0 position in Q4.28
+r5 = rs[28:24];   // 5 bits spanning [0, 2.0)
+g6 = gs[28:23];   // 6 bits spanning [0, 2.0)
+b5 = bs[28:24];   // 5 bits spanning [0, 2.0)
+```
+
+### Why this was hard to find
+
+Three other bugs were fixed first, each partially responsible for bad colors:
+1. sin() activation was skipped on the output layer (training used sin, hardware didn't)
+2. Output values were read from `acc_sat` (pre-activation) instead of `sin_output` (post-activation)
+3. The training script used tanh() while the hardware had no activation
+
+Each fix was necessary but insufficient. The bit extraction bug was the final one, and it produced identical visual symptoms to the others — making it impossible to tell which fix was "the one" until all three were resolved. This is a classic symptom-aliasing problem: multiple bugs produce the same visual output, so fixing one doesn't improve the result.
+
+### Lesson
+When converting fixed-point values to integer ranges, draw out the bit positions explicitly:
+
+```
+Q4.28 value 1.0 = 0x10000000:
+Bit:  31 30 29 28 27 26 25 24 23 22 ...
+       0  0  0  1  0  0  0  0  0  0 ...
+               ↑
+       This is the 1.0 position.
+       Your extraction MUST include it.
+```
+
+If your range is [0, 2.0), you need bit 28 as the MSB. If your range is [0, 1.0), you don't. Getting this wrong produces a modular arithmetic wrap that looks like quantization to {0, max}.
+
+## 10. Training/Hardware Activation Mismatch
+
+### Symptom
+Neural network output showed thresholded colors (same visual as bug #9) — values appeared clamped to extremes.
+
+### Root Cause
+The Python training script used `tanh()` on the output layer, while the FPGA hardware applied no activation function on the output layer. This meant the trained weights expected the output to be squashed through tanh(), but the FPGA passed through raw accumulator values (range [-8, +8]) directly to pack_rgb565, which clamped everything outside [-1, +1].
+
+### Fix (two parts)
+
+**Part 1**: Change training to use sin() on the output layer (matching the hardware, which has sin() LUTs available):
+
+```python
+# Before:
+def forward(self, x):
+    for layer in self.layers:
+        x = layer(x)
+    return torch.tanh(self.output_layer(x))  # tanh squash
+
+# After:
+def forward(self, x):
+    for layer in self.layers:
+        x = layer(x)
+    return torch.sin(self.output_layer(x))   # sin matches FPGA
+```
+
+**Part 2**: Change hardware to apply sin() on all layers including output:
+
+```verilog
+// Before: output layer skipped activation
+S_BIAS_ADD: begin
+    acc <= acc + bias;
+    if (cur_layer == N_LAYERS - 1)
+        state <= S_NEXT_N;      // Skip sin() for output
+    else
+        state <= S_ACTIVATE;    // sin() for hidden only
+end
+
+// After: all layers go through sin()
+S_BIAS_ADD: begin
+    acc <= acc + bias;
+    state <= S_ACTIVATE;        // Always apply sin()
+end
+```
+
+**Part 3**: Read post-activation values for output colors:
+
+```verilog
+// Before: read pre-sin accumulator
+case (cur_neuron[1:0])
+    2'd0: out_r <= acc_sat;     // Range [-8, +8] — gets clamped!
+
+// After: read post-sin LUT output
+case (cur_neuron[1:0])
+    2'd0: out_r <= sin_output;  // Range [-1, +1] — maps correctly
+```
+
+### Lesson
+When implementing a neural network in hardware, the activation function choice must match between training and inference **exactly**. There are no "close enough" activations — tanh and sin have different ranges, different gradients, and the weights are trained specifically for one. A mismatch doesn't produce "slightly wrong" results; it produces completely wrong results because the weight values encode assumptions about the activation function's behavior.
+
+## 11. Parallel Multiplier LUT Overflow
+
+### Symptom
+Synthesis failed with the FPGA exceeding 100% LUT utilization (~56,400 LUTs used vs 53,200 available).
+
+### Root Cause
+The first MLP implementation used 3 parallel multipliers per core (matching the Mandelbrot design). Each core had a 387-entry weight array with 3 simultaneous read ports. Vivado generated multiplexer trees for the parallel weight reads: 3 ports × 387 entries × 32-bit values × 18 cores = enormous mux fan-out.
+
+### Fix
+Switched to a sequential MAC (Multiply-ACcumulate) architecture: 1 multiplier per core, 1 weight read per cycle, weights stored in BRAM (1 read port). This traded throughput (~2.5× slower per pixel) for dramatically lower LUT usage.
+
+| Design | DSPs | LUTs | BRAM | FPS |
+|--------|------|------|------|-----|
+| 3-mul parallel | 216 | 56,400 (fails) | 50 | ~70 (theoretical) |
+| 1-mul sequential | 72 | 16,600 | 82 | ~26 |
+
+### Lesson
+On FPGAs, memory access patterns matter more than compute parallelism. A large ROM with multiple read ports synthesizes as LUT-based multiplexers that can easily overflow the fabric. BRAM has fixed port counts (dual-port maximum) but costs zero LUTs.
+
 ## Summary Table
 
 | Bug | Symptom | Time to Debug | Lesson |
@@ -188,3 +328,6 @@ spi_dc <= cur_init_val[8];
 | Array ports | Won't compile | ~30 min | Flatten to wide buses |
 | SCK gating | First byte corrupt | ~2 hours | Gate SCK with shifting flag |
 | Function bit-select | Won't synthesize | ~15 min | Assign to wire first |
+| RGB565 bit extraction | Binary color bands | ~6 hours | Include the 1.0 position bit |
+| Activation mismatch | Thresholded colors | ~3 hours | Train and infer with same activation |
+| Parallel mux overflow | LUT utilization >100% | ~4 hours | Use BRAM, not LUT-ROM with N ports |

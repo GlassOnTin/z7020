@@ -1,10 +1,29 @@
 # System Architecture
 
-This document describes the overall architecture of the neural Mandelbrot explorer, covering the module hierarchy, data flow, memory architecture, and clock domain.
+This document describes the overall architecture of the neural Mandelbrot explorer, covering the module hierarchy, data flow, memory architecture, and clock domain. The design supports two compute modes selectable at synthesis time via the `COMPUTE_MODE` parameter.
+
+## Dual-Mode Architecture
+
+The top-level `mandelbrot_top.v` accepts a `COMPUTE_MODE` generic:
+
+| Mode | Value | Core | Output | Use case |
+|------|-------|------|--------|----------|
+| Mandelbrot | 0 (default) | `neuron_core` | Iteration count → colormap → RGB565 | Fractal rendering |
+| MLP/SIREN | 1 | `mlp_core` | RGB565 directly from network output | Neural generative art |
+
+Both modes share the same scheduler, framebuffer, SPI display driver, and handshake protocol. The build command selects the mode:
+
+```bash
+# Mandelbrot mode (default)
+vivado -mode batch -source vivado/run_all.tcl
+
+# MLP mode
+vivado -mode batch -source vivado/run_all.tcl -tclargs 1
+```
 
 ## Block Diagram
 
-The design is a single-clock datapath that generates Mandelbrot set images and streams them to an SPI-connected LCD:
+The design is a single-clock datapath that generates images and streams them to an SPI-connected LCD:
 
 ```
                  50 MHz
@@ -145,19 +164,38 @@ A delayed `sweep_wr_v1` signal gates writes so the first 2 cycles of the sweep (
 
 ## Module Hierarchy
 
+### Mode 0: Mandelbrot
+
 ```
-mandelbrot_top
+mandelbrot_top (COMPUTE_MODE=0)
 ├── neuron_core × 18          (generate loop)
 │   ├── fixed_mul (mul_a)     z_re * z_re
 │   ├── fixed_mul (mul_b)     z_im * z_im
 │   └── fixed_mul (mul_c)     z_re * z_im
 ├── pixel_scheduler × 1
-├── colormap_lut × 1
+├── colormap_lut × 1          iter → RGB565
 ├── sp2_spi_driver × 1
 └── boot_msg × 1              UART "MANDELBROT QSPI OK\r\n"
 ```
 
-Plus the three BRAM framebuffers (`iter_fb`, `disp_fb_a`, `disp_fb_b`), the color sweep state machine, and the auto-zoom controller, all inlined in `mandelbrot_top.v`.
+Plus `iter_fb` (iteration counts), `disp_fb_a`/`disp_fb_b` (double-buffered RGB565), the color sweep state machine, and the auto-zoom controller.
+
+### Mode 1: MLP/SIREN
+
+```
+mandelbrot_top (COMPUTE_MODE=1)
+├── mlp_core × 18             (generate loop)
+│   ├── fixed_mul (u_mac)     sequential MAC
+│   ├── sine_lut (u_sine)     sin() activation
+│   └── weight_mem [0:511]    BRAM weights (from mlp_weights.vh)
+├── pixel_scheduler × 1       (same as Mode 0)
+├── sp2_spi_driver × 1        (same as Mode 0)
+└── boot_msg × 1
+```
+
+In MLP mode, `iter_fb` and `colormap_lut` are bypassed. The cores write RGB565 directly to double-buffered display framebuffers (`disp_fb_0`/`disp_fb_1`). The auto-zoom controller is replaced by a simple frame counter that increments `max_iter` each frame (interpreted as time by the MLP cores).
+
+See [mlp-core.md](mlp-core.md) for details on the MLP inference engine, and [siren-training.md](siren-training.md) for the training and deployment pipeline.
 
 ## Key Design Decisions
 
