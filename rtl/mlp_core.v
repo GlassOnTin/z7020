@@ -211,8 +211,9 @@ module mlp_core #(
     assign pixel_ready = (state == S_IDLE);
     assign busy        = (state != S_IDLE);
 
-    // Time: max_iter / 16 in Q4.28
-    wire signed [WIDTH-1:0] time_val = {16'b0, max_iter} << 12;
+    // Time: scale max_iter to Q4.28 so 4*pi (~12.57) is reached in ~800 frames
+    // << 22 gives 0.0156 per frame; at ~26 FPS, full 4*pi cycle in ~31 seconds
+    wire signed [WIDTH-1:0] time_val = {16'b0, max_iter} << 22;
 
     // Saturate accumulator to Q4.28
     wire signed [WIDTH-1:0] acc_sat;
