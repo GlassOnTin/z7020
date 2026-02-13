@@ -345,12 +345,14 @@ module mandelbrot_top #(
     end endgenerate
 
     // =========================================================
-    // Display framebuffer — single buffer (BRAM, dual-port)
+    // Display framebuffer
     // =========================================================
-    (* ram_style = "block" *) reg [15:0] disp_fb [0:FB_DEPTH-1];
     reg [15:0] disp_fb_rd;
 
-    generate if (COMPUTE_MODE == 0) begin : gen_disp_wr_mandelbrot
+    generate if (COMPUTE_MODE == 0) begin : gen_disp_fb
+        // Mandelbrot: single disp_fb (iter_fb is already double-buffered)
+        (* ram_style = "block" *) reg [15:0] disp_fb [0:FB_DEPTH-1];
+
         // Colormap write pipeline: delay address to match iter_fb read + colormap latency
         reg [15:0] color_wr_addr;
         reg [15:0] color_wr_addr_d;
@@ -365,19 +367,40 @@ module mandelbrot_top #(
             if (color_valid)
                 disp_fb[color_wr_addr_d] <= color_rgb565;
         end
-    end else begin : gen_disp_wr_mlp
-        // MLP mode: scheduler result carries RGB565 directly
-        // Write to disp_fb on the same signal the scheduler uses
+
+        // Port B: Read for SPI driver
         always @(posedge clk) begin
-            if (fb_iter_wr_en)
-                disp_fb[fb_iter_wr_addr] <= fb_iter_wr_data;
+            disp_fb_rd <= disp_fb[fb_disp_addr];
+        end
+
+    end else begin : gen_disp_fb
+        // MLP: double-buffered disp_fb (no iter_fb exists)
+        // iter_buf_sel: 0 = compute writes buf 0, SPI reads buf 1
+        //               1 = compute writes buf 1, SPI reads buf 0
+        (* ram_style = "block" *) reg [15:0] disp_fb_0 [0:FB_DEPTH-1];
+        (* ram_style = "block" *) reg [15:0] disp_fb_1 [0:FB_DEPTH-1];
+
+        // Write: scheduler result → back buffer
+        always @(posedge clk) begin
+            if (fb_iter_wr_en && !iter_buf_sel)
+                disp_fb_0[fb_iter_wr_addr] <= fb_iter_wr_data;
+        end
+        always @(posedge clk) begin
+            if (fb_iter_wr_en && iter_buf_sel)
+                disp_fb_1[fb_iter_wr_addr] <= fb_iter_wr_data;
+        end
+
+        // Read: SPI reads front buffer
+        reg [15:0] disp_fb_0_rd, disp_fb_1_rd;
+        always @(posedge clk) begin
+            disp_fb_0_rd <= disp_fb_0[fb_disp_addr];
+            disp_fb_1_rd <= disp_fb_1[fb_disp_addr];
+        end
+
+        always @(*) begin
+            disp_fb_rd = iter_buf_sel ? disp_fb_0_rd : disp_fb_1_rd;
         end
     end endgenerate
-
-    // Port B: Read for SPI driver (shared between modes)
-    always @(posedge clk) begin
-        disp_fb_rd <= disp_fb[fb_disp_addr];
-    end
 
     // =========================================================
     // SP2 SPI display driver
@@ -476,8 +499,7 @@ module mandelbrot_top #(
                 end
 
                 if (frame_done_w && !frame_busy_w) begin
-                    // No buffer swap needed in MLP mode (direct disp_fb write)
-                    // but keep toggling for scheduler compatibility
+                    // Swap double-buffered disp_fb
                     iter_buf_sel <= ~iter_buf_sel;
                     // Increment time each frame (wraps at 65535)
                     max_iter_w <= max_iter_w + 1;
