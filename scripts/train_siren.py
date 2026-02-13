@@ -379,21 +379,48 @@ def target_shallow_water(x, y, t):
     u = _interp_field(snaps_u, x, y, t, t_max)
     v = _interp_field(snaps_v, x, y, t, t_max)
 
-    # Colormap: height → brightness, velocity → hue
-    h_rest = 1.0
-    h_dev = (h - h_rest)  # deviation from rest, typically [-0.3, 0.4]
-
-    # Normalize for display: height deviation → [-1, 1]
-    h_norm = np.clip(h_dev * 2.5, -1, 1)
-
-    # Velocity magnitude for brightness modulation
+    # Velocity-based colormap: flow direction → hue, speed → saturation,
+    # height → brightness. Makes wave fronts vivid even for small amplitudes.
     speed = np.sqrt(u**2 + v**2)
-    s_norm = np.clip(speed * 2.0, 0, 1)
+    s_norm = np.clip(speed * 5.0, 0, 1)  # amplify small velocities
 
-    # Ocean colormap: deep navy troughs → teal midline → white foam peaks
-    r_out = np.clip(h_norm * 1.8 + s_norm * 0.6 - 0.6, -1, 1)
-    g_out = np.clip(h_norm * 1.4 + s_norm * 0.4 + 0.0, -1, 1)
-    b_out = np.clip(h_norm * 0.5 + 0.3, -1, 1)
+    # Flow angle → hue (using atan2, mapping [-pi, pi] to [0, 1])
+    angle = np.arctan2(v, u)  # [-pi, pi]
+    hue = (angle + np.pi) / (2 * np.pi)  # [0, 1]
+
+    # Height deviation for brightness
+    h_dev = h - 1.0
+    bright = np.clip(0.5 + h_dev * 3.0, 0.1, 1.0)
+
+    # HSV-like: hue from velocity direction, saturation from speed, value from height
+    # Convert HSV to RGB manually
+    h6 = hue * 6.0
+    sector = np.floor(h6).astype(int) % 6
+    frac = h6 - np.floor(h6)
+    p = bright * (1 - s_norm)
+    q = bright * (1 - s_norm * frac)
+    t_val = bright * (1 - s_norm * (1 - frac))
+
+    r_out = np.where(sector == 0, bright,
+            np.where(sector == 1, q,
+            np.where(sector == 2, p,
+            np.where(sector == 3, p,
+            np.where(sector == 4, t_val, bright)))))
+    g_out = np.where(sector == 0, t_val,
+            np.where(sector == 1, bright,
+            np.where(sector == 2, bright,
+            np.where(sector == 3, q,
+            np.where(sector == 4, p, p)))))
+    b_out = np.where(sector == 0, p,
+            np.where(sector == 1, p,
+            np.where(sector == 2, t_val,
+            np.where(sector == 3, bright,
+            np.where(sector == 4, bright, q)))))
+
+    # Map [0, 1] → [-1, +1] for SIREN output range
+    r_out = r_out * 2.0 - 1.0
+    g_out = g_out * 2.0 - 1.0
+    b_out = b_out * 2.0 - 1.0
 
     return np.stack([r_out, g_out, b_out], axis=-1)
 
