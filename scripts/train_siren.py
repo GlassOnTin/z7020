@@ -94,7 +94,7 @@ if HAS_TORCH:
         def forward(self, x):
             for layer in self.layers:
                 x = layer(x)
-            return torch.tanh(self.output_layer(x))  # clamp to [-1, +1]
+            return torch.sin(self.output_layer(x))  # sin() matches FPGA hardware
 
 
 # =========================================================
@@ -143,10 +143,34 @@ def target_plasma(x, y, t):
     return np.stack([r, g, b], axis=-1)
 
 
+def target_hsv_flow(x, y, t):
+    """Smooth rainbow flow — hue varies with position and time, full saturation.
+
+    Uses cosine-based HSV→RGB so all 3 channels are always in [0,1] before
+    mapping to [-1,+1].  No regions of pure black in any channel, giving
+    rich mixed colors (cyans, magentas, yellows) everywhere.
+    """
+    # Scalar field → hue angle
+    v1 = np.sin(x * 3.0 + t)
+    v2 = np.sin(y * 2.5 + t * 0.7)
+    v3 = np.sin(np.sqrt(x**2 + y**2 + 0.01) * 4.0 - t * 0.9)
+    v4 = np.sin((x - y) * 2.0 + t * 1.1)
+    angle = (v1 + v2 + v3 + v4) * (np.pi * 0.5)
+
+    # HSV→RGB via cosine (S=1, V=1): always in [0,1]
+    r = 0.5 + 0.5 * np.cos(angle)
+    g = 0.5 + 0.5 * np.cos(angle - 2.0 * np.pi / 3.0)
+    b = 0.5 + 0.5 * np.cos(angle - 4.0 * np.pi / 3.0)
+
+    # Map [0,1] → [-1,+1] for SIREN output range
+    return np.stack([r * 2 - 1, g * 2 - 1, b * 2 - 1], axis=-1)
+
+
 PATTERNS = {
     'lava_lamp': target_lava_lamp,
     'reaction_diffusion': target_reaction_diffusion,
     'plasma': target_plasma,
+    'hsv_flow': target_hsv_flow,
 }
 
 
@@ -183,7 +207,7 @@ def train_siren(pattern='plasma', epochs=2000, lr=1e-4, hidden=16):
     colors_t = torch.from_numpy(colors)
 
     model = SIREN(in_features=3, hidden_features=hidden, out_features=3,
-                  hidden_layers=1, omega_0=30.0, omega_hidden=1.0)
+                  hidden_layers=1, omega_0=10.0, omega_hidden=1.0)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
 

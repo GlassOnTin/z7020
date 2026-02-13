@@ -354,14 +354,8 @@ module mlp_core #(
                 S_BIAS_ADD: begin
                     // Add bias from BRAM read
                     acc <= acc + {{4{w_data[WIDTH-1]}}, w_data};
-
-                    if (cur_layer == N_LAYERS - 1) begin
-                        // Output layer: no activation
-                        state <= S_NEXT_N;
-                    end else begin
-                        // Hidden layer: sin() activation
-                        state <= S_ACTIVATE;
-                    end
+                    // All layers use sin() activation (matches SIREN training)
+                    state <= S_ACTIVATE;
                 end
 
                 // -------------------------------------------------
@@ -389,10 +383,12 @@ module mlp_core #(
                 S_NEXT_N: begin
                     // For output layer: store channel value
                     if (cur_layer == N_LAYERS - 1) begin
+                        // Use sin_output (post-activation) not acc_sat (pre-sin)
+                        // sin_output is still valid: sin_input unchanged since S_ACTIVATE
                         case (cur_neuron[1:0])
-                            2'd0: out_r <= acc_sat;
-                            2'd1: out_g <= acc_sat;
-                            2'd2: out_b <= acc_sat;
+                            2'd0: out_r <= sin_output;
+                            2'd1: out_g <= sin_output;
+                            2'd2: out_b <= sin_output;
                             default: ;
                         endcase
                     end
@@ -447,19 +443,20 @@ module mlp_core #(
             bs = b_val + 32'sh1000_0000;
 
             // Extract 5 bits for R: [0, 2.0) → [0, 31]
+            // Bit 28 is the 1.0 position, so [28:24] spans the full [0,2) range
             if (rs[WIDTH-1])          r5 = 5'd0;     // negative = clamp to 0
             else if (rs >= 32'sh2000_0000) r5 = 5'd31;  // >= 2.0 = clamp to max
-            else                      r5 = rs[27:23]; // bits [27:23] of [0, 2.0)
+            else                      r5 = rs[28:24];
 
-            // 6 bits for G
+            // 6 bits for G: [28:23] spans [0, 2) → [0, 63]
             if (gs[WIDTH-1])          g6 = 6'd0;
             else if (gs >= 32'sh2000_0000) g6 = 6'd63;
-            else                      g6 = gs[27:22];
+            else                      g6 = gs[28:23];
 
             // 5 bits for B
             if (bs[WIDTH-1])          b5 = 5'd0;
             else if (bs >= 32'sh2000_0000) b5 = 5'd31;
-            else                      b5 = bs[27:23];
+            else                      b5 = bs[28:24];
 
             pack_rgb565 = {r5, g6, b5};
         end
