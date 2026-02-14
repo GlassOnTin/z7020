@@ -778,6 +778,760 @@ def target_combustion(x, y, t):
     return np.stack([r_out, g_out, b_out], axis=-1)
 
 
+# =========================================================
+# Euler / vorticity evolution
+# =========================================================
+
+def _solve_euler_vorticity(nx=128, ny=128, nt=4000, nu=0.001):
+    """Solve 2D incompressible Euler in vorticity-stream function form.
+
+    dw/dt + u·nabla(w) = nu * laplacian(w)   (nearly inviscid)
+    laplacian(psi) = -w
+    u = dpsi/dy, v = -dpsi/dx
+
+    IC: perturbed shear layer (Kelvin-Helmholtz instability).
+    Returns w array of shape (nx, ny, n_snapshots).
+    """
+    dx = 2.0 / (nx - 1)
+    dy = 2.0 / (ny - 1)
+
+    x = np.linspace(-1, 1, nx)
+    y = np.linspace(-1, 1, ny)
+    xx, yy = np.meshgrid(x, y, indexing='ij')
+
+    # Shear layer: u = tanh(y/delta) with perturbation
+    delta = 0.08
+    w = -1.0 / (delta * np.cosh(yy / delta)**2)  # vorticity of tanh profile
+    # Add sinusoidal perturbation to trigger KH roll-up
+    w += 0.05 * np.sin(2 * np.pi * xx) * np.exp(-yy**2 / (4*delta**2))
+    # Second mode for richer structure
+    w += 0.03 * np.sin(4 * np.pi * xx + 0.7) * np.exp(-yy**2 / (4*delta**2))
+
+    psi = np.zeros((nx, ny))
+
+    dt_diff = 0.2 * dx**2 / max(nu, 1e-6)
+    dt = min(dt_diff, 0.005)
+
+    n_snap = 64
+    save_every = max(1, nt // n_snap)
+    snaps_w = []
+
+    for step in range(nt):
+        if step % save_every == 0:
+            snaps_w.append(w.copy())
+
+        # Poisson solve: laplacian(psi) = -w
+        for _ in range(25):
+            psi[1:-1,1:-1] = 0.25 * (
+                psi[2:,1:-1] + psi[:-2,1:-1] +
+                psi[1:-1,2:] + psi[1:-1,:-2] +
+                dx**2 * w[1:-1,1:-1])
+            psi[0,:] = 0; psi[-1,:] = 0
+            psi[:,0] = 0; psi[:,-1] = 0
+
+        # Velocity
+        u_vel = np.zeros_like(psi)
+        v_vel = np.zeros_like(psi)
+        u_vel[1:-1,1:-1] = (psi[1:-1,2:] - psi[1:-1,:-2]) / (2*dy)
+        v_vel[1:-1,1:-1] = -(psi[2:,1:-1] - psi[:-2,1:-1]) / (2*dx)
+
+        # Laplacian of w
+        Lw = np.zeros_like(w)
+        Lw[1:-1,1:-1] = (w[2:,1:-1] + w[:-2,1:-1] +
+                          w[1:-1,2:] + w[1:-1,:-2] - 4*w[1:-1,1:-1]) / dx**2
+
+        # Upwind advection
+        adv = np.zeros_like(w)
+        adv[1:-1,1:-1] += np.where(u_vel[1:-1,1:-1] > 0,
+            u_vel[1:-1,1:-1] * (w[1:-1,1:-1] - w[:-2,1:-1]) / dx,
+            u_vel[1:-1,1:-1] * (w[2:,1:-1] - w[1:-1,1:-1]) / dx)
+        adv[1:-1,1:-1] += np.where(v_vel[1:-1,1:-1] > 0,
+            v_vel[1:-1,1:-1] * (w[1:-1,1:-1] - w[1:-1,:-2]) / dy,
+            v_vel[1:-1,1:-1] * (w[1:-1,2:] - w[1:-1,1:-1]) / dy)
+
+        # Adaptive CFL
+        u_max = max(np.abs(u_vel).max(), np.abs(v_vel).max(), 0.01)
+        dt_adv = 0.3 * dx / u_max
+        dt = min(dt_diff, dt_adv, 0.005)
+
+        w += dt * (-adv + nu * Lw)
+
+        # Periodic in x, zero at y boundaries
+        w[0,:] = w[-2,:]
+        w[-1,:] = w[1,:]
+        w[:,0] = 0; w[:,-1] = 0
+
+        w = np.clip(w, -30, 30)
+        if np.any(np.isnan(w)):
+            w = np.nan_to_num(w, nan=0.0)
+            psi = np.nan_to_num(psi, nan=0.0)
+
+    return np.stack(snaps_w, axis=-1)
+
+
+def target_euler_vorticity(x, y, t):
+    """Kelvin-Helmholtz vortex roll-up — nearly inviscid Euler flow.
+
+    Vorticity mapped to hue (cyclonic/anticyclonic = warm/cool),
+    magnitude to brightness.
+    """
+    if not hasattr(target_euler_vorticity, '_cache'):
+        print("    Solving Euler vorticity equations (KH instability)...")
+        target_euler_vorticity._cache = _solve_euler_vorticity()
+        print("    Simulation complete.")
+
+    snaps_w = target_euler_vorticity._cache
+    t_max = 8.0
+
+    w = _interp_field(snaps_w, x, y, t, t_max)
+
+    # Vorticity colormap: blue/cyan for negative (clockwise),
+    # red/yellow for positive (counterclockwise), dark for zero
+    w_max = 8.0
+    w_norm = np.clip(w / w_max, -1, 1)  # [-1, 1]
+    mag = np.abs(w_norm)
+
+    # Diverging colormap: cool→dark→warm
+    r_out = np.clip(w_norm * 2.0, -1, 1)                    # positive = red
+    g_out = np.clip(mag * 1.5 - 0.3, -1, 1)                 # bright for strong
+    b_out = np.clip(-w_norm * 2.0, -1, 1)                   # negative = blue
+
+    return np.stack([r_out, g_out, b_out], axis=-1)
+
+
+# =========================================================
+# Lid-driven cavity
+# =========================================================
+
+def _solve_lid_cavity(nx=96, ny=96, nt=5000, Re_final=400):
+    """Solve lid-driven cavity flow via vorticity-stream function.
+
+    Top wall moves at u=1. Re ramps from 50 to Re_final over time
+    to show transition from creeping flow to recirculating eddies.
+    Returns (w, psi) arrays of shape (nx, ny, n_snapshots).
+    """
+    dx = 2.0 / (nx - 1)
+    dy = 2.0 / (ny - 1)
+
+    x = np.linspace(-1, 1, nx)
+    y = np.linspace(-1, 1, ny)
+
+    w = np.zeros((nx, ny))
+    psi = np.zeros((nx, ny))
+
+    n_snap = 64
+    save_every = max(1, nt // n_snap)
+    snaps_w = []
+    snaps_psi = []
+
+    for step in range(nt):
+        if step % save_every == 0:
+            snaps_w.append(w.copy())
+            snaps_psi.append(psi.copy())
+
+        # Ramp Reynolds number
+        Re = 50 + (Re_final - 50) * min(1.0, step / (nt * 0.6))
+        nu = 1.0 / Re
+
+        dt_diff = 0.15 * dx**2 / nu
+        dt = min(dt_diff, 0.003)
+
+        # Poisson: laplacian(psi) = -w
+        for _ in range(25):
+            psi[1:-1,1:-1] = 0.25 * (
+                psi[2:,1:-1] + psi[:-2,1:-1] +
+                psi[1:-1,2:] + psi[1:-1,:-2] +
+                dx**2 * w[1:-1,1:-1])
+            # psi = 0 on all walls (no-slip)
+            psi[0,:] = 0; psi[-1,:] = 0
+            psi[:,0] = 0; psi[:,-1] = 0
+
+        # Velocity
+        u_vel = np.zeros_like(psi)
+        v_vel = np.zeros_like(psi)
+        u_vel[1:-1,1:-1] = (psi[1:-1,2:] - psi[1:-1,:-2]) / (2*dy)
+        v_vel[1:-1,1:-1] = -(psi[2:,1:-1] - psi[:-2,1:-1]) / (2*dx)
+
+        # Laplacian of w
+        Lw = np.zeros_like(w)
+        Lw[1:-1,1:-1] = (w[2:,1:-1] + w[:-2,1:-1] +
+                          w[1:-1,2:] + w[1:-1,:-2] - 4*w[1:-1,1:-1]) / dx**2
+
+        # Upwind advection
+        adv = np.zeros_like(w)
+        adv[1:-1,1:-1] += np.where(u_vel[1:-1,1:-1] > 0,
+            u_vel[1:-1,1:-1] * (w[1:-1,1:-1] - w[:-2,1:-1]) / dx,
+            u_vel[1:-1,1:-1] * (w[2:,1:-1] - w[1:-1,1:-1]) / dx)
+        adv[1:-1,1:-1] += np.where(v_vel[1:-1,1:-1] > 0,
+            v_vel[1:-1,1:-1] * (w[1:-1,1:-1] - w[1:-1,:-2]) / dy,
+            v_vel[1:-1,1:-1] * (w[1:-1,2:] - w[1:-1,1:-1]) / dy)
+
+        # Adaptive CFL
+        u_max = max(np.abs(u_vel).max(), np.abs(v_vel).max(), 0.01)
+        dt_adv = 0.3 * dx / u_max
+        dt = min(dt_diff, dt_adv, 0.003)
+
+        w += dt * (-adv + nu * Lw)
+
+        # Wall vorticity BCs (Thom's formula)
+        u_lid = 1.0
+        w[:,-1] = -2 * (psi[:,-2] - 0) / dy**2 - 2 * u_lid / dy   # top (moving)
+        w[:,0]  = -2 * (psi[:,1] - 0) / dy**2                        # bottom
+        w[0,:]  = -2 * (psi[1,:] - 0) / dx**2                        # left
+        w[-1,:] = -2 * (psi[-2,:] - 0) / dx**2                       # right
+
+        w = np.clip(w, -50, 50)
+        if np.any(np.isnan(w)):
+            w = np.nan_to_num(w, nan=0.0)
+            psi = np.nan_to_num(psi, nan=0.0)
+
+    return np.stack(snaps_w, axis=-1), np.stack(snaps_psi, axis=-1)
+
+
+def target_lid_cavity(x, y, t):
+    """Lid-driven cavity flow with increasing Reynolds number.
+
+    Stream function for flow visualization, vorticity for color intensity.
+    Shows transition from single primary vortex to corner eddies.
+    """
+    if not hasattr(target_lid_cavity, '_cache'):
+        print("    Solving lid-driven cavity flow...")
+        target_lid_cavity._cache = _solve_lid_cavity()
+        print("    Simulation complete.")
+
+    snaps_w, snaps_psi = target_lid_cavity._cache
+    t_max = 8.0
+
+    w = _interp_field(snaps_w, x, y, t, t_max)
+    psi = _interp_field(snaps_psi, x, y, t, t_max)
+
+    # Colormap: stream function → flow structure, vorticity → intensity
+    psi_max = max(np.abs(psi).max(), 0.01)
+    psi_norm = psi / psi_max  # [-1, 1]
+    w_norm = np.clip(w / 20.0, -1, 1)
+
+    r_out = np.clip(psi_norm * 1.5 + np.abs(w_norm) * 0.5, -1, 1)
+    g_out = np.clip(-psi_norm * 0.8 + 0.3 * np.abs(w_norm), -1, 1)
+    b_out = np.clip(-w_norm * 1.2, -1, 1)
+
+    return np.stack([r_out, g_out, b_out], axis=-1)
+
+
+# =========================================================
+# Rayleigh-Taylor instability
+# =========================================================
+
+def _solve_rayleigh_taylor(nx=128, ny=128, nt=5000):
+    """Solve Rayleigh-Taylor instability via Boussinesq approximation.
+
+    Heavy fluid (rho=2) on top of light fluid (rho=1).
+    Gravity pulls the interface down, creating mushroom-shaped plumes.
+
+    d(rho)/dt + u·nabla(rho) = kappa * laplacian(rho)
+    dw/dt + u·nabla(w) = nu * laplacian(w) + g * d(rho)/dx (buoyancy)
+    laplacian(psi) = -w
+
+    Returns (rho, w) arrays of shape (nx, ny, n_snapshots).
+    """
+    dx = 2.0 / (nx - 1)
+    dy = 2.0 / (ny - 1)
+
+    x = np.linspace(-1, 1, nx)
+    y = np.linspace(-1, 1, ny)
+    xx, yy = np.meshgrid(x, y, indexing='ij')
+
+    nu = 0.003       # viscosity
+    kappa = 0.002    # density diffusion (numerical)
+    g_buoy = 3.0     # buoyancy strength
+
+    # Initial condition: heavy on top, perturbed interface
+    interface = 0.05 * np.sin(2 * np.pi * xx) + 0.03 * np.sin(4 * np.pi * xx + 0.5)
+    rho = 1.0 + 0.5 * (1.0 + np.tanh((yy - interface) / 0.05))  # smooth step
+
+    w = np.zeros((nx, ny))
+    psi = np.zeros((nx, ny))
+
+    dt_diff = 0.15 * dx**2 / max(nu, kappa)
+    dt = min(dt_diff, 0.003)
+
+    n_snap = 64
+    save_every = max(1, nt // n_snap)
+    snaps_rho = []
+    snaps_w = []
+
+    for step in range(nt):
+        if step % save_every == 0:
+            snaps_rho.append(rho.copy())
+            snaps_w.append(w.copy())
+
+        # Poisson
+        for _ in range(25):
+            psi[1:-1,1:-1] = 0.25 * (
+                psi[2:,1:-1] + psi[:-2,1:-1] +
+                psi[1:-1,2:] + psi[1:-1,:-2] +
+                dx**2 * w[1:-1,1:-1])
+            psi[0,:] = 0; psi[-1,:] = 0
+            psi[:,0] = 0; psi[:,-1] = 0
+
+        # Velocity
+        u_vel = np.zeros_like(psi)
+        v_vel = np.zeros_like(psi)
+        u_vel[1:-1,1:-1] = (psi[1:-1,2:] - psi[1:-1,:-2]) / (2*dy)
+        v_vel[1:-1,1:-1] = -(psi[2:,1:-1] - psi[:-2,1:-1]) / (2*dx)
+
+        # Laplacians
+        def lap(f):
+            L = np.zeros_like(f)
+            L[1:-1,1:-1] = (f[2:,1:-1] + f[:-2,1:-1] +
+                            f[1:-1,2:] + f[1:-1,:-2] - 4*f[1:-1,1:-1]) / dx**2
+            return L
+
+        # Upwind advection
+        def advect(f, u, v):
+            A = np.zeros_like(f)
+            A[1:-1,1:-1] += np.where(u[1:-1,1:-1] > 0,
+                u[1:-1,1:-1] * (f[1:-1,1:-1] - f[:-2,1:-1]) / dx,
+                u[1:-1,1:-1] * (f[2:,1:-1] - f[1:-1,1:-1]) / dx)
+            A[1:-1,1:-1] += np.where(v[1:-1,1:-1] > 0,
+                v[1:-1,1:-1] * (f[1:-1,1:-1] - f[1:-1,:-2]) / dy,
+                v[1:-1,1:-1] * (f[1:-1,2:] - f[1:-1,1:-1]) / dy)
+            return A
+
+        # Buoyancy: horizontal density gradient (rotated gravity)
+        # For classic RT, gravity is in -y direction → buoyancy torque = g * drho/dx
+        drho_dx = np.zeros_like(rho)
+        drho_dx[1:-1,1:-1] = (rho[2:,1:-1] - rho[:-2,1:-1]) / (2*dx)
+
+        # Adaptive CFL
+        u_max = max(np.abs(u_vel).max(), np.abs(v_vel).max(), 0.01)
+        dt_adv = 0.3 * dx / u_max
+        dt = min(dt_diff, dt_adv, 0.003)
+
+        rho += dt * (-advect(rho, u_vel, v_vel) + kappa * lap(rho))
+        w += dt * (-advect(w, u_vel, v_vel) + nu * lap(w) + g_buoy * drho_dx)
+
+        # Boundaries: no-slip walls
+        rho[0,:] = rho[1,:]; rho[-1,:] = rho[-2,:]
+        rho[:,0] = rho[:,1]; rho[:,-1] = rho[:,-2]
+        w[0,:] = 0; w[-1,:] = 0
+        w[:,0] = 0; w[:,-1] = 0
+
+        rho = np.clip(rho, 0.5, 2.5)
+        w = np.clip(w, -30, 30)
+
+        if np.any(np.isnan(rho)):
+            rho = np.nan_to_num(rho, nan=1.0)
+            w = np.nan_to_num(w, nan=0.0)
+            psi = np.nan_to_num(psi, nan=0.0)
+
+    return np.stack(snaps_rho, axis=-1), np.stack(snaps_w, axis=-1)
+
+
+def target_rayleigh_taylor(x, y, t):
+    """Rayleigh-Taylor instability — heavy fluid sinking into light fluid.
+
+    Classic mushroom-shaped plumes with density-mapped coloring.
+    Heavy fluid = warm (red/orange), light fluid = cool (blue/purple).
+    """
+    if not hasattr(target_rayleigh_taylor, '_cache'):
+        print("    Solving Rayleigh-Taylor instability...")
+        target_rayleigh_taylor._cache = _solve_rayleigh_taylor()
+        print("    Simulation complete.")
+
+    snaps_rho, snaps_w = target_rayleigh_taylor._cache
+    t_max = 8.0
+
+    rho = _interp_field(snaps_rho, x, y, t, t_max)
+    w = _interp_field(snaps_w, x, y, t, t_max)
+
+    # Density colormap: light(1.0)=blue → heavy(2.0)=red/orange
+    rho_norm = np.clip((rho - 1.0) / 1.0, 0, 1)  # [0, 1]
+    # Vorticity for interface highlighting
+    w_norm = np.clip(np.abs(w) / 10.0, 0, 1)
+
+    r_out = np.clip(rho_norm * 2.5 - 0.5 + w_norm * 0.3, -1, 1)
+    g_out = np.clip(0.4 - np.abs(rho_norm - 0.5) * 1.5 + w_norm * 0.2, -1, 1)
+    b_out = np.clip((1.0 - rho_norm) * 2.0 - 0.3, -1, 1)
+
+    return np.stack([r_out, g_out, b_out], axis=-1)
+
+
+# =========================================================
+# Blast wave (Sedov-Taylor explosion)
+# =========================================================
+
+def _solve_blast_wave(nx=128, ny=128, nt=3000):
+    """Solve 2D blast wave using acoustic wave equation with nonlinear source.
+
+    d²p/dt² = c² laplacian(p) - damping
+    Central high-pressure pulse creates expanding shockwave rings.
+    Fireball (temperature) decays slower than pressure wave propagates.
+
+    Returns (pressure, fireball) arrays of shape (nx, ny, n_snapshots).
+    """
+    dx = 2.0 / (nx - 1)
+    dy = 2.0 / (ny - 1)
+    c = 1.5  # wave speed
+
+    x = np.linspace(-1, 1, nx)
+    y = np.linspace(-1, 1, ny)
+    xx, yy = np.meshgrid(x, y, indexing='ij')
+    rr = np.sqrt(xx**2 + yy**2)
+
+    dt = 0.3 * dx / c  # CFL
+
+    # Initial condition: moderate pressure pulse at center
+    p = 2.0 * np.exp(-rr**2 / 0.02)  # wider Gaussian, lower peak
+    p_prev = p.copy()  # zero initial velocity (dp/dt = 0)
+
+    # Fireball: thermal energy that decays slowly
+    fireball = 2.5 * np.exp(-rr**2 / 0.03)
+
+    # Absorbing boundary mask (precompute)
+    edge = np.minimum(
+        np.minimum(xx + 1, 1 - xx),
+        np.minimum(yy + 1, 1 - yy)
+    )
+    absorb = np.clip(edge / 0.2, 0, 1)
+
+    n_snap = 64
+    save_every = max(1, nt // n_snap)
+    snaps_p = []
+    snaps_fb = []
+
+    damping = 0.997  # energy loss per step
+
+    for step in range(nt):
+        if step % save_every == 0:
+            snaps_p.append(p.copy())
+            snaps_fb.append(fireball.copy())
+
+        # Laplacian of pressure
+        Lp = np.zeros_like(p)
+        Lp[1:-1,1:-1] = (p[2:,1:-1] + p[:-2,1:-1] +
+                          p[1:-1,2:] + p[1:-1,:-2] - 4*p[1:-1,1:-1]) / dx**2
+
+        # Verlet integration: p_next = 2*p - p_prev + c²*dt²*Lp
+        p_next = 2 * p - p_prev + c**2 * dt**2 * Lp
+        p_next *= damping * absorb
+
+        p_prev = p
+        p = np.clip(p_next, -5.0, 5.0)
+
+        # Fireball decays and spreads slowly (diffusion)
+        Lfb = np.zeros_like(fireball)
+        Lfb[1:-1,1:-1] = (fireball[2:,1:-1] + fireball[:-2,1:-1] +
+                           fireball[1:-1,2:] + fireball[1:-1,:-2] -
+                           4*fireball[1:-1,1:-1]) / dx**2
+        fireball += dt * 0.2 * Lfb  # slow thermal diffusion
+        fireball *= 0.9993           # slow cooling
+        fireball = np.clip(fireball, 0, 5.0)
+
+        # Boundary
+        p[0,:] = 0; p[-1,:] = 0
+        p[:,0] = 0; p[:,-1] = 0
+
+        if np.any(np.isnan(p)):
+            p = np.nan_to_num(p, nan=0.0)
+            p_prev = np.nan_to_num(p_prev, nan=0.0)
+            fireball = np.nan_to_num(fireball, nan=0.0)
+
+    return np.stack(snaps_p, axis=-1), np.stack(snaps_fb, axis=-1)
+
+
+def target_blast_wave(x, y, t):
+    """Nuclear blast wave — expanding shockwave ring with central fireball.
+
+    Pressure wave → bright ring expanding outward.
+    Fireball → hot center fading from white to orange to red.
+    """
+    if not hasattr(target_blast_wave, '_cache'):
+        print("    Solving blast wave equations...")
+        target_blast_wave._cache = _solve_blast_wave()
+        print("    Simulation complete.")
+
+    snaps_p, snaps_fb = target_blast_wave._cache
+    t_max = 8.0
+
+    p = _interp_field(snaps_p, x, y, t, t_max)
+    fb = _interp_field(snaps_fb, x, y, t, t_max)
+
+    # Pressure wave: bright white/blue ring
+    p_abs = np.clip(np.abs(p) / 2.0, 0, 1)
+    # Fireball: blackbody progression
+    fb_norm = np.clip(fb / 2.5, 0, 1)
+
+    # Combine: fireball dominates center, pressure ring at edges
+    r_out = np.clip(fb_norm * 2.5 - 0.2 + p_abs * 1.5, -1, 1)
+    g_out = np.clip(fb_norm * 1.8 - 0.6 + p_abs * 1.0, -1, 1)
+    b_out = np.clip(fb_norm * 0.8 - 0.8 + p_abs * 2.0, -1, 1)
+
+    return np.stack([r_out, g_out, b_out], axis=-1)
+
+
+# =========================================================
+# Droplet splash
+# =========================================================
+
+def _solve_droplet_splash(nx=128, ny=128, nt=2500, g=3.0):
+    """Solve droplet impact using shallow water equations.
+
+    Central impulse creates expanding concentric ring waves
+    that reflect off boundaries and interfere.
+    Surface tension approximated via 4th-order term.
+
+    Returns (h, speed) arrays of shape (nx, ny, n_snapshots).
+    """
+    dx = 2.0 / (nx - 1)
+    dy = 2.0 / (ny - 1)
+
+    x = np.linspace(-1, 1, nx)
+    y = np.linspace(-1, 1, ny)
+    xx, yy = np.meshgrid(x, y, indexing='ij')
+    rr = np.sqrt(xx**2 + yy**2)
+
+    # Initial condition: calm surface with central crater + rim (moderate)
+    h_rest = 1.0
+    h = h_rest * np.ones((nx, ny))
+    # Crown splash: ring of raised water around central depression
+    h += -0.3 * np.exp(-rr**2 / 0.015)  # wider, shallower crater
+    h += 0.25 * np.exp(-(rr - 0.15)**2 / 0.005)  # crown rim
+
+    hu = np.zeros((nx, ny))
+    hv = np.zeros((nx, ny))
+
+    # Radial outward momentum from impact (moderate)
+    theta = np.arctan2(yy, xx)
+    speed_init = 0.6 * np.exp(-(rr - 0.12)**2 / 0.008) * rr
+    hu += speed_init * np.cos(theta) * h
+    hv += speed_init * np.sin(theta) * h
+
+    c_max = np.sqrt(g * h.max()) + 1.0
+    dt = 0.15 * min(dx, dy) / c_max  # conservative CFL
+
+    n_snap = 64
+    save_every = max(1, nt // n_snap)
+    snaps_h = []
+    snaps_spd = []
+
+    for step in range(nt):
+        if step % save_every == 0:
+            u_vel = np.where(h > 0.01, hu / h, 0.0)
+            v_vel = np.where(h > 0.01, hv / h, 0.0)
+            speed = np.sqrt(u_vel**2 + v_vel**2)
+            snaps_h.append(h.copy())
+            snaps_spd.append(speed.copy())
+
+        # Lax-Friedrichs for shallow water
+        f0 = hu
+        f1 = np.where(h > 0.01, hu**2 / h + 0.5 * g * h**2, 0.5 * g * h**2)
+        f2 = np.where(h > 0.01, hu * hv / h, 0.0)
+
+        g0 = hv
+        g1 = np.where(h > 0.01, hu * hv / h, 0.0)
+        g2 = np.where(h > 0.01, hv**2 / h + 0.5 * g * h**2, 0.5 * g * h**2)
+
+        h_avg  = 0.25 * (h[2:,1:-1]  + h[:-2,1:-1]  + h[1:-1,2:]  + h[1:-1,:-2])
+        hu_avg = 0.25 * (hu[2:,1:-1] + hu[:-2,1:-1] + hu[1:-1,2:] + hu[1:-1,:-2])
+        hv_avg = 0.25 * (hv[2:,1:-1] + hv[:-2,1:-1] + hv[1:-1,2:] + hv[1:-1,:-2])
+
+        h_new  = h_avg  - dt/(2*dx) * (f0[2:,1:-1] - f0[:-2,1:-1]) \
+                        - dt/(2*dy) * (g0[1:-1,2:] - g0[1:-1,:-2])
+        hu_new = hu_avg - dt/(2*dx) * (f1[2:,1:-1] - f1[:-2,1:-1]) \
+                        - dt/(2*dy) * (g1[1:-1,2:] - g1[1:-1,:-2])
+        hv_new = hv_avg - dt/(2*dx) * (f2[2:,1:-1] - f2[:-2,1:-1]) \
+                        - dt/(2*dy) * (g2[1:-1,2:] - g2[1:-1,:-2])
+
+        h[1:-1,1:-1]  = h_new
+        hu[1:-1,1:-1] = hu_new
+        hv[1:-1,1:-1] = hv_new
+
+        # Reflective boundaries
+        h[0,:] = h[1,:];   h[-1,:] = h[-2,:]
+        h[:,0] = h[:,1];   h[:,-1] = h[:,-2]
+        hu[0,:] = -hu[1,:];  hu[-1,:] = -hu[-2,:]
+        hu[:,0] = hu[:,1];    hu[:,-1] = hu[:,-2]
+        hv[0,:] = hv[1,:];   hv[-1,:] = hv[-2,:]
+        hv[:,0] = -hv[:,1];   hv[:,-1] = -hv[:,-2]
+
+        h = np.maximum(h, 0.01)
+
+        # Clip momentum (prevents velocity blowup)
+        max_mom = 3.0 * h
+        hu = np.clip(hu, -max_mom, max_mom)
+        hv = np.clip(hv, -max_mom, max_mom)
+
+        hu *= 0.9997
+        hv *= 0.9997
+
+        if np.any(np.isnan(h)):
+            h = np.nan_to_num(h, nan=h_rest)
+            hu = np.nan_to_num(hu, nan=0.0)
+            hv = np.nan_to_num(hv, nan=0.0)
+
+    return np.stack(snaps_h, axis=-1), np.stack(snaps_spd, axis=-1)
+
+
+def target_droplet_splash(x, y, t):
+    """Droplet splash — radial crown splash with expanding ring waves.
+
+    Height deviations mapped to water-like colors (dark blue depths,
+    white crests, cyan body). Speed adds foam/spray highlights.
+    """
+    if not hasattr(target_droplet_splash, '_cache'):
+        print("    Solving droplet splash (shallow water with impact)...")
+        target_droplet_splash._cache = _solve_droplet_splash()
+        print("    Simulation complete.")
+
+    snaps_h, snaps_spd = target_droplet_splash._cache
+    t_max = 8.0
+
+    h = _interp_field(snaps_h, x, y, t, t_max)
+    spd = _interp_field(snaps_spd, x, y, t, t_max)
+
+    # Water colormap
+    h_dev = h - 1.0  # deviation from rest
+    h_norm = np.clip(h_dev * 3.0, -1, 1)  # amplify
+    spd_norm = np.clip(spd / 1.5, 0, 1)
+
+    # Deep blue for troughs, white/cyan for crests, foam for fast areas
+    r_out = np.clip(h_norm * 0.6 + spd_norm * 1.2 - 0.5, -1, 1)
+    g_out = np.clip(h_norm * 0.8 + spd_norm * 0.8 - 0.1, -1, 1)
+    b_out = np.clip(0.3 + h_norm * 0.4 + spd_norm * 0.5, -1, 1)
+
+    return np.stack([r_out, g_out, b_out], axis=-1)
+
+
+# =========================================================
+# Phase-field fracture
+# =========================================================
+
+def _solve_fracture(nx=128, ny=128, nt=4000):
+    """Solve phase-field fracture propagation.
+
+    Quasi-static elasticity with damage evolution:
+    - Strain energy drives crack growth
+    - Phase field phi=1 (intact) → phi=0 (broken)
+    - Crack nucleates from notch, branches under stress
+
+    dphi/dt = -M * (G_c/l * (phi - l²∇²phi) - 2*(1-phi)*psi_e)
+
+    where psi_e is elastic strain energy.
+    Simplified: use Laplace equation for stress, phase-field for damage.
+
+    Returns (phi, stress) arrays of shape (nx, ny, n_snapshots).
+    """
+    dx = 2.0 / (nx - 1)
+    dy = 2.0 / (ny - 1)
+
+    x = np.linspace(-1, 1, nx)
+    y = np.linspace(-1, 1, ny)
+    xx, yy = np.meshgrid(x, y, indexing='ij')
+
+    # Phase field: 1 = intact, 0 = broken
+    phi = np.ones((nx, ny))
+
+    # Pre-existing notch (left side, horizontal)
+    notch = (xx < -0.3) & (np.abs(yy) < 0.02)
+    phi[notch] = 0.0
+
+    # Material parameters
+    Gc = 1.0         # fracture toughness
+    l_pf = 0.06      # phase-field length scale
+    M = 0.5           # mobility
+
+    # Applied strain increases over time
+    n_snap = 64
+    save_every = max(1, nt // n_snap)
+    snaps_phi = []
+    snaps_stress = []
+
+    stress = np.zeros((nx, ny))
+
+    for step in range(nt):
+        if step % save_every == 0:
+            snaps_phi.append(phi.copy())
+            snaps_stress.append(stress.copy())
+
+        # Ramp applied displacement (tension in y-direction)
+        strain_y = 0.5 + 2.5 * min(1.0, step / (nt * 0.7))
+
+        # Solve stress field (simplified: Laplace with displacement BCs)
+        # sigma = phi² * E * epsilon (degraded by damage)
+        # Use Laplace relaxation for stress equilibrium
+        for _ in range(15):
+            stress[1:-1,1:-1] = 0.25 * (
+                stress[2:,1:-1] + stress[:-2,1:-1] +
+                stress[1:-1,2:] + stress[1:-1,:-2])
+            # BCs: tension at top/bottom
+            stress[:,-1] = strain_y     # top: tension
+            stress[:,0] = -strain_y     # bottom: tension (opposite)
+            stress[0,:] = stress[1,:]   # free sides
+            stress[-1,:] = stress[-2,:]
+
+        # Elastic strain energy density
+        # Gradient of stress gives strain
+        dsdx = np.zeros_like(stress)
+        dsdy = np.zeros_like(stress)
+        dsdx[1:-1,:] = (stress[2:,:] - stress[:-2,:]) / (2*dx)
+        dsdy[:,1:-1] = (stress[:,2:] - stress[:,:-2]) / (2*dy)
+        psi_e = 0.5 * (dsdx**2 + dsdy**2)
+
+        # Phase-field Laplacian
+        Lphi = np.zeros_like(phi)
+        Lphi[1:-1,1:-1] = (phi[2:,1:-1] + phi[:-2,1:-1] +
+                            phi[1:-1,2:] + phi[1:-1,:-2] - 4*phi[1:-1,1:-1]) / dx**2
+
+        # Phase-field evolution (Allen-Cahn type)
+        dt = 0.002
+        driving = Gc / l_pf * (phi - l_pf**2 * Lphi) - 2.0 * (1 - phi) * psi_e
+        phi -= dt * M * driving
+
+        # Irreversibility: damage can only increase (phi can only decrease)
+        phi = np.clip(phi, 0, 1)
+
+        # Add slight randomness for crack branching
+        if step % 200 == 0 and step > nt * 0.3:
+            rng = np.random.RandomState(step)
+            phi -= 0.01 * rng.rand(nx, ny) * (1 - phi) * (psi_e > np.percentile(psi_e, 90))
+            phi = np.clip(phi, 0, 1)
+
+        if np.any(np.isnan(phi)):
+            phi = np.nan_to_num(phi, nan=1.0)
+            stress = np.nan_to_num(stress, nan=0.0)
+
+    return np.stack(snaps_phi, axis=-1), np.stack(snaps_stress, axis=-1)
+
+
+def target_fracture(x, y, t):
+    """Phase-field fracture — crack propagation through stressed material.
+
+    Intact material shows stress field (cool blue → warm red under tension).
+    Crack appears as dark fissure cutting through the material.
+    """
+    if not hasattr(target_fracture, '_cache'):
+        print("    Solving phase-field fracture propagation...")
+        target_fracture._cache = _solve_fracture()
+        print("    Simulation complete.")
+
+    snaps_phi, snaps_stress = target_fracture._cache
+    t_max = 8.0
+
+    phi = _interp_field(snaps_phi, x, y, t, t_max)
+    stress = _interp_field(snaps_stress, x, y, t, t_max)
+
+    # Colormap: stress field visible through intact material, crack = dark
+    stress_norm = np.clip(stress / 3.0, -1, 1)
+    crack = 1.0 - phi  # 0=intact, 1=broken
+
+    # Intact regions: stress-colored (blue compression → red tension)
+    r_out = np.clip(stress_norm * 1.5 * phi - crack * 0.8, -1, 1)
+    g_out = np.clip((0.3 - np.abs(stress_norm)) * phi * 1.5 - crack * 0.5, -1, 1)
+    b_out = np.clip(-stress_norm * 1.5 * phi - crack * 0.3, -1, 1)
+
+    return np.stack([r_out, g_out, b_out], axis=-1)
+
+
 PATTERNS = {
     'lava_lamp': target_lava_lamp,
     'reaction_diffusion': target_reaction_diffusion,
@@ -787,6 +1541,12 @@ PATTERNS = {
     'gray_scott': target_gray_scott,
     'float_glass': target_float_glass,
     'combustion': target_combustion,
+    'euler_vorticity': target_euler_vorticity,
+    'lid_cavity': target_lid_cavity,
+    'rayleigh_taylor': target_rayleigh_taylor,
+    'blast_wave': target_blast_wave,
+    'droplet_splash': target_droplet_splash,
+    'fracture': target_fracture,
 }
 
 

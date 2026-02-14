@@ -1,31 +1,28 @@
 // mlp_core.v — MLP inference core (drop-in replacement for neuron_core)
 //
 // Computes a small SIREN network: inputs (x, y, t) → RGB565
-// Uses 1 pipelined fixed_mul instance for sequential MAC operations.
+// Uses 1 pipelined fixed_mul instance with BRAM weight storage.
 //
 // Network architecture: 3 → N_HIDDEN → N_HIDDEN → 3
 //   Layer 0: 3 inputs × N_HIDDEN outputs + N_HIDDEN biases
 //   Layer 1: N_HIDDEN inputs × N_HIDDEN outputs + N_HIDDEN biases
 //   Layer 2: N_HIDDEN inputs × 3 outputs + 3 biases
-//   Activation: sin(x) via sine_lut (SIREN activation)
+//   Activation: sin(x) via sine_lut (SIREN activation, all layers)
 //   Output: clamped to [0,1], scaled to RGB565
 //
-// Weight storage: BRAM (block RAM) per core, 512×32 bits.
-// Initialized from mlp_weights.vh at synthesis time.
+// Pipelined MAC: BRAM read (1 cycle) overlapped with multiply pipeline (3 cycles).
+// Issue 1 weight×activation multiply per cycle. Accumulate results as they emerge.
 //
-// Sequential MAC pipeline:
-//   1. Read weight from BRAM (1 cycle latency)
-//   2. Multiply weight × activation (3 cycle pipeline)
-//   3. Accumulate result
-//   Total: ~7 cycles per input (read + mul + acc), pipelined to ~4/input.
+// Cycle budget (N_HIDDEN=32, 3→32→32→3):
+//   Per neuron: fan_in + 11 cycles (MAC pipeline + bias + sin + overhead)
+//   Layer 0: 1 + 32 × 14 = 449
+//   Layer 1: 1 + 32 × 43 = 1377
+//   Layer 2: 1 + 3 × 43 = 130
+//   Total: ~1960 cycles/pixel
+//   18 cores × 50 MHz / 1960 = 459K pixels/sec → ~8 FPS at 320×172
 //
 // Cycle budget (N_HIDDEN=16, 3→16→16→3):
-//   Layer 0: (3+4) × 16 + 16×3 = 160
-//   Layer 1: (16+4) × 16 + 16×3 = 368
-//   Layer 2: (16+4) × 3 + 3×1 = 63
-//   Overhead: ~25
-//   Total: ~616 cycles/pixel
-//   18 cores × 50 MHz / 616 = 1.46M pixels/sec → ~26 FPS at 320×172
+//   Total: ~743 cycles/pixel → ~22 FPS at 320×172
 
 `timescale 1ns / 1ps
 
@@ -33,7 +30,7 @@ module mlp_core #(
     parameter WIDTH    = 32,
     parameter FRAC     = 28,
     parameter ITER_W   = 16,
-    parameter N_HIDDEN = 16,
+    parameter N_HIDDEN = 32,
     parameter N_LAYERS = 3
 )(
     input  wire                     clk,
@@ -56,33 +53,36 @@ module mlp_core #(
 
     localparam N_INPUT   = 3;
     localparam N_OUTPUT  = 3;
-    // Total params: (3*16+16) + (16*16+16) + (16*3+3) = 64 + 272 + 51 = 387
-    localparam N_WEIGHTS = 387;
-    localparam WADDR_W   = 9;  // ceil(log2(512))
+    // Total params: (3*H+H) + (H*H+H) + (H*3+3) where H=N_HIDDEN
+    localparam N_WEIGHTS = N_INPUT * N_HIDDEN + N_HIDDEN
+                         + N_HIDDEN * N_HIDDEN + N_HIDDEN
+                         + N_HIDDEN * N_OUTPUT + N_OUTPUT;
+    localparam WADDR_W   = (N_WEIGHTS <= 512)  ? 9  :
+                           (N_WEIGHTS <= 1024) ? 10 :
+                           (N_WEIGHTS <= 2048) ? 11 : 12;
+    // Counter width: must hold values up to N_HIDDEN (inclusive)
+    localparam CNT_W     = (N_HIDDEN <= 16) ? 5 :
+                           (N_HIDDEN <= 32) ? 6 : 7;
 
     // =========================================================
-    // Weight BRAM — 512 × 32-bit, initialized at synthesis
+    // Weight BRAM — initialized at synthesis
     // =========================================================
-    (* ram_style = "block" *) reg signed [WIDTH-1:0] weight_mem [0:511];
+    (* ram_style = "block" *) reg signed [WIDTH-1:0] weight_mem [0:(1<<WADDR_W)-1];
 
     `include "mlp_weights.vh"
 
-    // BRAM read port: registered address → 1 cycle read latency
+    // BRAM read port: 1-cycle latency
     reg  [WADDR_W-1:0] w_addr;
-    reg  signed [WIDTH-1:0] w_data;  // registered read output
+    reg  signed [WIDTH-1:0] w_data;
 
     always @(posedge clk) begin
         w_data <= weight_mem[w_addr];
     end
 
     // =========================================================
-    // Layer geometry (precomputed constants)
+    // Layer geometry
     // =========================================================
-    // Layer 0: fan_in=3,  fan_out=16, w_base=0,   b_base=48
-    // Layer 1: fan_in=16, fan_out=16, w_base=64,  b_base=320
-    // Layer 2: fan_in=16, fan_out=3,  w_base=336, b_base=384
-
-    function [4:0] get_fan_in;
+    function [CNT_W-1:0] get_fan_in;
         input [1:0] layer;
         case (layer)
             2'd0: get_fan_in = N_INPUT;
@@ -92,7 +92,7 @@ module mlp_core #(
         endcase
     endfunction
 
-    function [4:0] get_fan_out;
+    function [CNT_W-1:0] get_fan_out;
         input [1:0] layer;
         case (layer)
             2'd0: get_fan_out = N_HIDDEN;
@@ -106,9 +106,9 @@ module mlp_core #(
         input [1:0] layer;
         case (layer)
             2'd0: get_w_base = 0;
-            2'd1: get_w_base = N_INPUT * N_HIDDEN + N_HIDDEN;       // 64
+            2'd1: get_w_base = N_INPUT * N_HIDDEN + N_HIDDEN;
             2'd2: get_w_base = N_INPUT * N_HIDDEN + N_HIDDEN
-                             + N_HIDDEN * N_HIDDEN + N_HIDDEN;      // 336
+                             + N_HIDDEN * N_HIDDEN + N_HIDDEN;
             default: get_w_base = 0;
         endcase
     endfunction
@@ -116,12 +116,12 @@ module mlp_core #(
     function [WADDR_W-1:0] get_b_base;
         input [1:0] layer;
         case (layer)
-            2'd0: get_b_base = N_INPUT * N_HIDDEN;                  // 48
+            2'd0: get_b_base = N_INPUT * N_HIDDEN;
             2'd1: get_b_base = N_INPUT * N_HIDDEN + N_HIDDEN
-                             + N_HIDDEN * N_HIDDEN;                  // 320
+                             + N_HIDDEN * N_HIDDEN;
             2'd2: get_b_base = N_INPUT * N_HIDDEN + N_HIDDEN
                              + N_HIDDEN * N_HIDDEN + N_HIDDEN
-                             + N_OUTPUT * N_HIDDEN;                  // 384
+                             + N_OUTPUT * N_HIDDEN;
             default: get_b_base = 0;
         endcase
     endfunction
@@ -130,20 +130,17 @@ module mlp_core #(
     // FSM states
     // =========================================================
     localparam [3:0] S_IDLE      = 4'd0,
-                     S_SETUP     = 4'd1,   // set up layer params
-                     S_W_READ    = 4'd2,   // issue weight BRAM read
-                     S_W_WAIT    = 4'd3,   // wait for BRAM read latency
-                     S_MAC       = 4'd4,   // launch multiply
-                     S_MUL_WAIT  = 4'd5,   // wait for multiply pipeline
-                     S_ACC       = 4'd6,   // accumulate result
-                     S_BIAS_RD   = 4'd7,   // issue bias BRAM read
-                     S_BIAS_WAIT = 4'd8,   // wait for bias read
-                     S_BIAS_ADD  = 4'd9,   // add bias to accumulator
-                     S_ACTIVATE  = 4'd10,  // apply sin() activation
-                     S_ACT_WAIT  = 4'd11,  // wait for sine_lut latency
-                     S_NEXT_N    = 4'd12,  // advance to next neuron
-                     S_NEXT_L    = 4'd13,  // advance to next layer
-                     S_OUTPUT    = 4'd14;  // format RGB565
+                     S_SETUP     = 4'd1,   // cache layer params, set first weight addr
+                     S_DOT       = 4'd2,   // pipelined MAC (1 mul/cycle)
+                     S_DOT_DRAIN = 4'd3,   // drain multiply pipeline
+                     S_BIAS_RD   = 4'd4,   // issue bias BRAM read
+                     S_BIAS_WAIT = 4'd5,   // wait for BRAM read
+                     S_BIAS_ADD  = 4'd6,   // add bias to accumulator
+                     S_ACTIVATE  = 4'd7,   // apply sin() activation
+                     S_ACT_WAIT  = 4'd8,   // wait for sine_lut
+                     S_NEXT_N    = 4'd9,   // advance to next neuron
+                     S_NEXT_L    = 4'd10,  // advance to next layer
+                     S_OUTPUT    = 4'd11;  // format RGB565
 
     reg [3:0] state;
 
@@ -151,12 +148,12 @@ module mlp_core #(
     // Working registers
     // =========================================================
     reg [1:0]  cur_layer;
-    reg [4:0]  cur_neuron;
-    reg [4:0]  cur_k;
-    reg [4:0]  cur_fan_in;
-    reg [4:0]  cur_fan_out;
-    reg [WADDR_W-1:0] cur_w_base;
+    reg [CNT_W-1:0]  cur_neuron;
+    reg [CNT_W-1:0]  cur_k;
+    reg [CNT_W-1:0]  cur_fan_in;
+    reg [CNT_W-1:0]  cur_fan_out;
     reg [WADDR_W-1:0] cur_b_base;
+    reg [WADDR_W-1:0] next_w_ptr;  // saved weight addr for next neuron
     reg [15:0] pid_r;
 
     // 36-bit accumulator (4 bits overflow headroom)
@@ -211,19 +208,18 @@ module mlp_core #(
     assign pixel_ready = (state == S_IDLE);
     assign busy        = (state != S_IDLE);
 
-    // Time: use lower 9 bits of max_iter (0-511) to stay in [0, +8.0) Q4.28 range.
-    // << 22 gives 0.0156 per frame; 512 frames covers 0..7.98. At ~50 FPS,
-    // full cycle repeats every ~10 seconds. Masking to 9 bits avoids sign flip.
-    wire signed [WIDTH-1:0] time_val = {23'b0, max_iter[8:0]} << 22;
+    // Time: triangle wave (ping-pong) over [0, +8.0) in Q4.28.
+    // max_iter[9:0] gives 0-1023 ramp. Bit 9 selects direction:
+    //   bit 9 = 0: ascending  → time = max_iter[8:0] << 22  (0 → 7.98)
+    //   bit 9 = 1: descending → time = (511 - max_iter[8:0]) << 22  (7.98 → 0)
+    wire [8:0] phase = max_iter[9] ? (9'd511 - max_iter[8:0]) : max_iter[8:0];
+    wire signed [WIDTH-1:0] time_val = {23'b0, phase} << 22;
 
     // Saturate accumulator to Q4.28
     wire signed [WIDTH-1:0] acc_sat;
-    assign acc_sat = (acc[WIDTH+3] && !(&acc[WIDTH+2:WIDTH-1])) ? {1'b1, {(WIDTH-1){1'b0}}} :  // negative overflow
-                     (!acc[WIDTH+3] && |acc[WIDTH+2:WIDTH-1]) ? {1'b0, {(WIDTH-1){1'b1}}} :     // positive overflow
+    assign acc_sat = (acc[WIDTH+3] && !(&acc[WIDTH+2:WIDTH-1])) ? {1'b1, {(WIDTH-1){1'b0}}} :
+                     (!acc[WIDTH+3] && |acc[WIDTH+2:WIDTH-1]) ? {1'b0, {(WIDTH-1){1'b1}}} :
                      acc[WIDTH-1:0];
-
-    // Weight address for current neuron/input
-    wire [WADDR_W-1:0] w_addr_calc = cur_w_base + cur_neuron * cur_fan_in + cur_k;
 
     // =========================================================
     // Main FSM
@@ -238,8 +234,8 @@ module mlp_core #(
             cur_k           <= 0;
             cur_fan_in      <= 0;
             cur_fan_out     <= 0;
-            cur_w_base      <= 0;
             cur_b_base      <= 0;
+            next_w_ptr      <= 0;
             pid_r           <= 0;
             acc             <= 0;
             pipe_cnt        <= 0;
@@ -278,84 +274,79 @@ module mlp_core #(
                 end
 
                 // -------------------------------------------------
+                // S_SETUP: Cache layer params and issue first weight BRAM read.
+                // This cycle also serves as the BRAM fill cycle for the first
+                // neuron's first weight — w_data will be valid at next cycle.
                 S_SETUP: begin
-                    // Cache layer parameters
                     cur_fan_in  <= get_fan_in(cur_layer);
                     cur_fan_out <= get_fan_out(cur_layer);
-                    cur_w_base  <= get_w_base(cur_layer);
                     cur_b_base  <= get_b_base(cur_layer);
                     cur_neuron  <= 0;
                     cur_k       <= 0;
                     acc         <= 0;
-                    state       <= S_W_READ;
+                    w_addr      <= get_w_base(cur_layer);  // BRAM read starts
+                    state       <= S_DOT;
                 end
 
                 // -------------------------------------------------
-                S_W_READ: begin
-                    // Issue BRAM read for weight[w_base + neuron*fan_in + k]
-                    w_addr <= w_addr_calc;
-                    state  <= S_W_WAIT;
+                // S_DOT: Pipelined MAC. Each cycle:
+                //   - w_data has the weight for cur_k (from BRAM, read prev cycle)
+                //   - Launch multiply: w_data × act[cur_k]
+                //   - Set w_addr for next weight (BRAM read for next cycle)
+                //   - Accumulate results from 3 cycles ago (mul pipeline output)
+                S_DOT: begin
+                    if (cur_k < cur_fan_in) begin
+                        // Launch multiply with current weight and activation
+                        mul_in_a     <= w_data;
+                        mul_in_b     <= act_rd;
+                        mul_valid_in <= 1'b1;
+
+                        // Advance weight address for next cycle's BRAM read
+                        w_addr <= w_addr + 1;
+                        cur_k  <= cur_k + 1;
+                    end else begin
+                        // All inputs processed — save weight pointer and drain
+                        next_w_ptr <= w_addr;  // Points to next neuron's weights
+                        pipe_cnt   <= 0;
+                        state      <= S_DOT_DRAIN;
+                    end
+
+                    // Accumulate results from multiply pipeline
+                    if (mul_valid_out)
+                        acc <= acc + {{4{mul_result[WIDTH-1]}}, mul_result};
                 end
 
                 // -------------------------------------------------
-                S_W_WAIT: begin
-                    // BRAM read latency: 1 cycle. w_data available next cycle.
-                    state <= S_MAC;
-                end
+                // S_DOT_DRAIN: Wait for last multiply results to emerge.
+                // 3 cycles to drain the 3-stage pipeline.
+                S_DOT_DRAIN: begin
+                    if (mul_valid_out)
+                        acc <= acc + {{4{mul_result[WIDTH-1]}}, mul_result};
 
-                // -------------------------------------------------
-                S_MAC: begin
-                    // Launch multiply: w_data (from BRAM) × act_rd (from register bank)
-                    mul_in_a     <= w_data;
-                    mul_in_b     <= act_rd;
-                    mul_valid_in <= 1'b1;
-                    pipe_cnt     <= 0;
-                    state        <= S_MUL_WAIT;
-                end
-
-                // -------------------------------------------------
-                S_MUL_WAIT: begin
-                    // Wait 3 cycles for fixed_mul pipeline
                     if (pipe_cnt == 2'd2) begin
-                        state <= S_ACC;
+                        // Pipeline drained — read bias
+                        w_addr <= cur_b_base + cur_neuron;
+                        state  <= S_BIAS_RD;
                     end else begin
                         pipe_cnt <= pipe_cnt + 1;
                     end
                 end
 
                 // -------------------------------------------------
-                S_ACC: begin
-                    // Accumulate multiply result
-                    acc   <= acc + {{4{mul_result[WIDTH-1]}}, mul_result};
-                    cur_k <= cur_k + 1;
-
-                    if (cur_k + 1 < cur_fan_in) begin
-                        // More inputs: read next weight
-                        state <= S_W_READ;
-                    end else begin
-                        // Dot product done, read bias
-                        state <= S_BIAS_RD;
-                    end
-                end
-
-                // -------------------------------------------------
                 S_BIAS_RD: begin
-                    // Issue BRAM read for bias[b_base + neuron]
-                    w_addr <= cur_b_base + cur_neuron;
-                    state  <= S_BIAS_WAIT;
+                    // BRAM read latency cycle (bias address set in DRAIN)
+                    state <= S_BIAS_WAIT;
                 end
 
                 // -------------------------------------------------
                 S_BIAS_WAIT: begin
-                    // BRAM read latency
+                    // w_data now has the bias value
                     state <= S_BIAS_ADD;
                 end
 
                 // -------------------------------------------------
                 S_BIAS_ADD: begin
-                    // Add bias from BRAM read
-                    acc <= acc + {{4{w_data[WIDTH-1]}}, w_data};
-                    // All layers use sin() activation (matches SIREN training)
+                    acc   <= acc + {{4{w_data[WIDTH-1]}}, w_data};
                     state <= S_ACTIVATE;
                 end
 
@@ -370,6 +361,7 @@ module mlp_core #(
                 S_ACT_WAIT: begin
                     // sine_lut has 2-cycle latency
                     if (pipe_cnt == 2'd1) begin
+                        // Store activated value to output bank
                         if (bank_sel)
                             act_a[cur_neuron] <= sin_output;
                         else
@@ -384,8 +376,6 @@ module mlp_core #(
                 S_NEXT_N: begin
                     // For output layer: store channel value
                     if (cur_layer == N_LAYERS - 1) begin
-                        // Use sin_output (post-activation) not acc_sat (pre-sin)
-                        // sin_output is still valid: sin_input unchanged since S_ACTIVATE
                         case (cur_neuron[1:0])
                             2'd0: out_r <= sin_output;
                             2'd1: out_g <= sin_output;
@@ -395,10 +385,15 @@ module mlp_core #(
                     end
 
                     if (cur_neuron + 1 < cur_fan_out) begin
+                        // More neurons in this layer
                         cur_neuron <= cur_neuron + 1;
                         cur_k      <= 0;
                         acc        <= 0;
-                        state      <= S_W_READ;
+                        // Restore weight pointer for next neuron.
+                        // Also serves as BRAM fill cycle — w_data will be
+                        // valid when we enter S_DOT next cycle.
+                        w_addr     <= next_w_ptr;
+                        state      <= S_DOT;
                     end else begin
                         state <= S_NEXT_L;
                     end
@@ -444,12 +439,11 @@ module mlp_core #(
             bs = b_val + 32'sh1000_0000;
 
             // Extract 5 bits for R: [0, 2.0) → [0, 31]
-            // Bit 28 is the 1.0 position, so [28:24] spans the full [0,2) range
-            if (rs[WIDTH-1])          r5 = 5'd0;     // negative = clamp to 0
-            else if (rs >= 32'sh2000_0000) r5 = 5'd31;  // >= 2.0 = clamp to max
+            if (rs[WIDTH-1])          r5 = 5'd0;
+            else if (rs >= 32'sh2000_0000) r5 = 5'd31;
             else                      r5 = rs[28:24];
 
-            // 6 bits for G: [28:23] spans [0, 2) → [0, 63]
+            // 6 bits for G: [0, 2.0) → [0, 63]
             if (gs[WIDTH-1])          g6 = 6'd0;
             else if (gs >= 32'sh2000_0000) g6 = 6'd63;
             else                      g6 = gs[28:23];

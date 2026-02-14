@@ -22,7 +22,7 @@ module mandelbrot_top #(
     parameter V_RES     = 172,
     parameter PIX_COUNT = H_RES * V_RES,
     parameter TEST_MODE    = 0,   // 0=normal, 1=solid color (iter=42), 2=gradient (iter=pixel_id[15:8])
-    parameter COMPUTE_MODE = 0    // 0=Mandelbrot (neuron_core), 1=MLP inference (mlp_core)
+    parameter COMPUTE_MODE = 1    // 0=Mandelbrot (neuron_core), 1=MLP inference (mlp_core)
 )(
     input  wire        clk_50m,       // 50 MHz from PL crystal
     input  wire        rst_n_in,      // External reset (active low)
@@ -91,10 +91,12 @@ module mandelbrot_top #(
     // =========================================================
     // x: -1.0 to +1.0 across 320 pixels → step = 2.0/320
     // y: -1.0 to +1.0 across 172 pixels → step = 2.0/172
+    // Note: display pixels are non-square (1.86:1 aspect ratio).
+    // The SIREN is trained on [-1,+1]² so coordinates match.
     // In Q4.28:
     //   -1.0 = 0xF0000000
-    //   2.0/320 = 0.00625 → 0.00625 * 2^28 = 1677721.6 ≈ 0x0019999A
-    //   2.0/172 = 0.011628 → 0.011628 * 2^28 = 3122165.9 ≈ 0x002FA0BE
+    //   2.0/320 = 0.00625 → 0x0019999A
+    //   2.0/172 = 0.01163 → 0x002FA0BE
     localparam signed [WIDTH-1:0] MLP_CRE_START = 32'shF000_0000;  // -1.0
     localparam signed [WIDTH-1:0] MLP_CIM_START = 32'shF000_0000;  // -1.0
     localparam signed [WIDTH-1:0] MLP_CRE_STEP  = 32'sh0019_999A;  // 2.0/320
@@ -169,7 +171,7 @@ module mandelbrot_top #(
                 end else begin : gen_mlp
                     mlp_core #(
                         .WIDTH(WIDTH), .FRAC(FRAC), .ITER_W(ITER_W),
-                        .N_HIDDEN(16), .N_LAYERS(3)
+                        .N_HIDDEN(32), .N_LAYERS(3)
                     ) u_mlp (
                         .clk            (clk),
                         .rst_n          (rst_n),
@@ -501,8 +503,9 @@ module mandelbrot_top #(
                 if (frame_done_w && !frame_busy_w) begin
                     // Swap double-buffered disp_fb
                     iter_buf_sel <= ~iter_buf_sel;
-                    // Increment time each frame (wraps at 65535)
-                    max_iter_w <= max_iter_w + 1;
+                    // Increment time: +4 per frame → 128 frames per cycle (~2.5s at 50 FPS)
+                    // SIREN is a continuous function, no CFL stability constraint
+                    max_iter_w <= max_iter_w + 4;
                     frame_start_r <= 1;
                 end
             end
