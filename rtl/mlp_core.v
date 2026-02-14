@@ -1,7 +1,8 @@
-// mlp_core.v — MLP inference core (drop-in replacement for neuron_core)
+// mlp_core.v — MLP inference core with weight morphing
 //
 // Computes a small SIREN network: inputs (x, y, t) → RGB565
-// Uses 1 pipelined fixed_mul instance with BRAM weight storage.
+// Uses 1 pipelined fixed_mul instance with dual BRAM weight storage
+// and an inline blend pipeline for smooth morphing between two patterns.
 //
 // Network architecture: 3 → N_HIDDEN → N_HIDDEN → 3
 //   Layer 0: 3 inputs × N_HIDDEN outputs + N_HIDDEN biases
@@ -10,19 +11,13 @@
 //   Activation: sin(x) via sine_lut (SIREN activation, all layers)
 //   Output: clamped to [0,1], scaled to RGB565
 //
-// Pipelined MAC: BRAM read (1 cycle) overlapped with multiply pipeline (3 cycles).
-// Issue 1 weight×activation multiply per cycle. Accumulate results as they emerge.
+// Weight morphing: two weight sets (A and B) stored in separate BRAMs.
+// A blend pipeline computes w = w_a + ((w_b - w_a) * alpha) >> 8
+// with 1 cycle of pipeline latency, feeding the MAC at 1 weight/cycle.
 //
 // Cycle budget (N_HIDDEN=32, 3→32→32→3):
-//   Per neuron: fan_in + 11 cycles (MAC pipeline + bias + sin + overhead)
-//   Layer 0: 1 + 32 × 14 = 449
-//   Layer 1: 1 + 32 × 43 = 1377
-//   Layer 2: 1 + 3 × 43 = 130
-//   Total: ~1960 cycles/pixel
-//   18 cores × 50 MHz / 1960 = 459K pixels/sec → ~8 FPS at 320×172
-//
-// Cycle budget (N_HIDDEN=16, 3→16→16→3):
-//   Total: ~743 cycles/pixel → ~22 FPS at 320×172
+//   ~2000 cycles/pixel (1 extra cycle per neuron for blend fill)
+//   18 cores × 50 MHz / 2000 = ~450K pixels/sec → ~8 FPS at 320×172
 
 `timescale 1ns / 1ps
 
@@ -43,6 +38,7 @@ module mlp_core #(
     input  wire [15:0]              pixel_id,
 
     input  wire [ITER_W-1:0]        max_iter,   // time parameter
+    input  wire [7:0]               alpha,      // morph blend: 0=pattern A, 255=pattern B
 
     output reg                      result_valid,
     output reg  [15:0]              result_pixel_id,
@@ -65,19 +61,37 @@ module mlp_core #(
                            (N_HIDDEN <= 32) ? 6 : 7;
 
     // =========================================================
-    // Weight BRAM — initialized at synthesis
+    // Weight BRAMs — two sets for morphing, initialized at synthesis
     // =========================================================
-    (* ram_style = "block" *) reg signed [WIDTH-1:0] weight_mem [0:(1<<WADDR_W)-1];
+    (* ram_style = "block" *) reg signed [WIDTH-1:0] weight_mem   [0:(1<<WADDR_W)-1];
+    (* ram_style = "block" *) reg signed [WIDTH-1:0] weight_b_mem [0:(1<<WADDR_W)-1];
 
     `include "mlp_weights.vh"
 
-    // BRAM read port: 1-cycle latency
+    // BRAM read ports: 1-cycle latency, same address
     reg  [WADDR_W-1:0] w_addr;
-    reg  signed [WIDTH-1:0] w_data;
+    reg  signed [WIDTH-1:0] w_data, wb_data;
 
     always @(posedge clk) begin
-        w_data <= weight_mem[w_addr];
+        w_data  <= weight_mem[w_addr];
+        wb_data <= weight_b_mem[w_addr];
     end
+
+    // =========================================================
+    // Blend pipeline (1 registered stage)
+    // =========================================================
+    // Computes: blended = w_a + ((w_b - w_a) * alpha) >> 8
+    // Combinational blend path: BRAM output → sub → mul(32×9) → shift → add
+    // Critical path ~11ns, meets 50 MHz (20ns period)
+    wire signed [WIDTH-1:0] w_diff = wb_data - w_data;
+    wire signed [8:0]       alpha_s = {1'b0, alpha};
+    wire signed [40:0]      blend_prod = w_diff * alpha_s;
+    wire signed [WIDTH-1:0] blended_w_comb = w_data + blend_prod[39:8];
+
+    // Registered blend pipeline output
+    reg signed [WIDTH-1:0] bp_weight;   // blended weight
+    reg signed [WIDTH-1:0] bp_act;      // delayed activation (matches blend latency)
+    reg                    bp_valid;    // delayed feeding flag
 
     // =========================================================
     // Layer geometry
@@ -160,7 +174,10 @@ module mlp_core #(
     reg signed [WIDTH+3:0] acc;
 
     // Pipeline counter
-    reg [1:0] pipe_cnt;
+    reg [2:0] pipe_cnt;
+
+    // Feeding flag: high when S_DOT is issuing weights to BRAMs
+    reg feeding;
 
     // =========================================================
     // Activation register banks (double-buffered)
@@ -186,6 +203,30 @@ module mlp_core #(
         .valid_in(mul_valid_in),
         .result(mul_result), .valid_out(mul_valid_out)
     );
+
+    // =========================================================
+    // Blend pipeline drives MAC inputs
+    // =========================================================
+    // The blend pipeline registers (bp_weight, bp_act, bp_valid) are
+    // updated every cycle. When bp_valid is high, feed the MAC.
+    always @(posedge clk) begin
+        bp_weight <= blended_w_comb;
+        bp_act    <= act_rd;
+        bp_valid  <= feeding;
+    end
+
+    // MAC input mux: blend pipeline output when valid, else from FSM (for future use)
+    always @(*) begin
+        if (bp_valid) begin
+            mul_in_a     = bp_weight;
+            mul_in_b     = bp_act;
+            mul_valid_in = 1'b1;
+        end else begin
+            mul_in_a     = 0;
+            mul_in_b     = 0;
+            mul_valid_in = 1'b0;
+        end
+    end
 
     // =========================================================
     // Sine LUT for SIREN activation
@@ -240,9 +281,7 @@ module mlp_core #(
             acc             <= 0;
             pipe_cnt        <= 0;
             bank_sel        <= 0;
-            mul_in_a        <= 0;
-            mul_in_b        <= 0;
-            mul_valid_in    <= 0;
+            feeding         <= 0;
             sin_input       <= 0;
             result_valid    <= 0;
             result_pixel_id <= 0;
@@ -257,7 +296,7 @@ module mlp_core #(
             end
         end else begin
             result_valid <= 0;
-            mul_valid_in <= 0;
+            feeding      <= 0;
 
             case (state)
                 // -------------------------------------------------
@@ -275,8 +314,8 @@ module mlp_core #(
 
                 // -------------------------------------------------
                 // S_SETUP: Cache layer params and issue first weight BRAM read.
-                // This cycle also serves as the BRAM fill cycle for the first
-                // neuron's first weight — w_data will be valid at next cycle.
+                // This cycle serves as the BRAM fill cycle — both w_data and wb_data
+                // will be valid next cycle, and the blend pipeline output 1 cycle after.
                 S_SETUP: begin
                     cur_fan_in  <= get_fan_in(cur_layer);
                     cur_fan_out <= get_fan_out(cur_layer);
@@ -289,24 +328,21 @@ module mlp_core #(
                 end
 
                 // -------------------------------------------------
-                // S_DOT: Pipelined MAC. Each cycle:
-                //   - w_data has the weight for cur_k (from BRAM, read prev cycle)
-                //   - Launch multiply: w_data × act[cur_k]
-                //   - Set w_addr for next weight (BRAM read for next cycle)
-                //   - Accumulate results from 3 cycles ago (mul pipeline output)
+                // S_DOT: Issue BRAM addresses and track cur_k.
+                // The blend pipeline (1 cycle later) feeds the MAC autonomously.
+                // MAC results (3 cycles after blend feeds) are accumulated here.
                 S_DOT: begin
                     if (cur_k < cur_fan_in) begin
-                        // Launch multiply with current weight and activation
-                        mul_in_a     <= w_data;
-                        mul_in_b     <= act_rd;
-                        mul_valid_in <= 1'b1;
-
+                        // Signal blend pipeline: valid data arriving from BRAM
+                        feeding <= 1'b1;
                         // Advance weight address for next cycle's BRAM read
                         w_addr <= w_addr + 1;
                         cur_k  <= cur_k + 1;
                     end else begin
-                        // All inputs processed — save weight pointer and drain
-                        next_w_ptr <= w_addr;  // Points to next neuron's weights
+                        // All inputs issued — save weight pointer and drain
+                        // Note: blend pipeline will output last result next cycle
+                        // (bp_valid stays high 1 more cycle from delayed feeding)
+                        next_w_ptr <= w_addr;
                         pipe_cnt   <= 0;
                         state      <= S_DOT_DRAIN;
                     end
@@ -317,14 +353,15 @@ module mlp_core #(
                 end
 
                 // -------------------------------------------------
-                // S_DOT_DRAIN: Wait for last multiply results to emerge.
-                // 3 cycles to drain the 3-stage pipeline.
+                // S_DOT_DRAIN: Wait for blend pipeline + MAC pipeline to flush.
+                // Cycle 0: blend pipeline outputs last weight → MAC starts.
+                // Cycles 1-3: MAC pipeline drains.
                 S_DOT_DRAIN: begin
                     if (mul_valid_out)
                         acc <= acc + {{4{mul_result[WIDTH-1]}}, mul_result};
 
-                    if (pipe_cnt == 2'd2) begin
-                        // Pipeline drained — read bias
+                    if (pipe_cnt == 3'd3) begin
+                        // Pipeline fully drained — read bias
                         w_addr <= cur_b_base + cur_neuron;
                         state  <= S_BIAS_RD;
                     end else begin
@@ -340,13 +377,16 @@ module mlp_core #(
 
                 // -------------------------------------------------
                 S_BIAS_WAIT: begin
-                    // w_data now has the bias value
+                    // w_data and wb_data now have bias values from both BRAMs.
+                    // blended_w_comb has the blended bias (combinational).
                     state <= S_BIAS_ADD;
                 end
 
                 // -------------------------------------------------
                 S_BIAS_ADD: begin
-                    acc   <= acc + {{4{w_data[WIDTH-1]}}, w_data};
+                    // Use registered blend pipeline output (bp_weight) which
+                    // captured the blended bias during BIAS_WAIT.
+                    acc   <= acc + {{4{bp_weight[WIDTH-1]}}, bp_weight};
                     state <= S_ACTIVATE;
                 end
 
@@ -390,8 +430,7 @@ module mlp_core #(
                         cur_k      <= 0;
                         acc        <= 0;
                         // Restore weight pointer for next neuron.
-                        // Also serves as BRAM fill cycle — w_data will be
-                        // valid when we enter S_DOT next cycle.
+                        // Also serves as BRAM fill cycle.
                         w_addr     <= next_w_ptr;
                         state      <= S_DOT;
                     end else begin

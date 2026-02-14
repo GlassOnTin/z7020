@@ -143,6 +143,10 @@ module mandelbrot_top #(
     reg signed [WIDTH-1:0] zoom_cim_start;
     reg startup;
 
+    // Morph alpha: 0=pattern A, 255=pattern B (ping-pong)
+    reg [7:0] morph_alpha;
+    reg       morph_dir;
+
     // =========================================================
     // Neuron pool + Pixel scheduler (or test-mode substitute)
     // =========================================================
@@ -181,6 +185,7 @@ module mandelbrot_top #(
                         .c_im           (neuron_c_im_w),
                         .pixel_id       (neuron_pixel_id_w),
                         .max_iter       (max_iter_w),
+                        .alpha          (morph_alpha),
                         .result_valid   (result_valid_w[i]),
                         .result_pixel_id(result_pixel_id_w[i*16 +: 16]),
                         .result_iter    (result_iter_w[i*ITER_W +: ITER_W]),
@@ -450,6 +455,8 @@ module mandelbrot_top #(
                 zoom_cim_start <= DEFAULT_CIM_START;
                 max_iter_w     <= DEFAULT_MAX_ITER;
                 iter_buf_sel   <= 0;
+                morph_alpha    <= 0;
+                morph_dir      <= 0;
             end else begin
                 frame_start_r <= 0;
 
@@ -482,6 +489,7 @@ module mandelbrot_top #(
     end else begin : gen_mlp_ctrl
         // --- MLP time-stepping controller ---
         // Fixed viewport [-1,+1], max_iter increments as time parameter
+        // morph_alpha ping-pongs 0→255→0 for weight morphing
         always @(posedge clk or negedge rst_n) begin
             if (!rst_n) begin
                 frame_start_r  <= 0;
@@ -492,6 +500,8 @@ module mandelbrot_top #(
                 zoom_cim_start <= MLP_CIM_START;
                 max_iter_w     <= 0;
                 iter_buf_sel   <= 0;
+                morph_alpha    <= 0;
+                morph_dir      <= 0;
             end else begin
                 frame_start_r <= 0;
 
@@ -503,10 +513,23 @@ module mandelbrot_top #(
                 if (frame_done_w && !frame_busy_w) begin
                     // Swap double-buffered disp_fb
                     iter_buf_sel <= ~iter_buf_sel;
-                    // Increment time: +4 per frame → 128 frames per cycle (~2.5s at 50 FPS)
-                    // SIREN is a continuous function, no CFL stability constraint
+                    // Increment time: +4 per frame
                     max_iter_w <= max_iter_w + 4;
                     frame_start_r <= 1;
+
+                    // Morph alpha: ping-pong between patterns A and B
+                    // At ~8 FPS: 256 frames per half-cycle = ~32s per morph
+                    if (!morph_dir) begin
+                        if (morph_alpha == 8'd255)
+                            morph_dir <= 1'b1;
+                        else
+                            morph_alpha <= morph_alpha + 1;
+                    end else begin
+                        if (morph_alpha == 8'd0)
+                            morph_dir <= 1'b0;
+                        else
+                            morph_alpha <= morph_alpha - 1;
+                    end
                 end
             end
         end
