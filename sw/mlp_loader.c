@@ -64,12 +64,15 @@
 
 /* Time values: sweep [0..1023] mapping to t ∈ [-1.0, +1.0] via RTL.
  * With 3 frames: sample start, middle, and end of each segment's time range.
- * RTL maps: time_val = time_step * (2/1024) - 1.0 in Q4.28. */
+ * RTL maps: time_val = time_step * (2/1024) - 1.0 in Q4.28.
+ *
+ * NOTE: Weight morphing (alpha blending between banks) was tried but produces
+ * distorted midpoint frames — SIREN weight-space interpolation is non-smooth
+ * for independently-trained networks due to sin() activations. Hard cuts
+ * between segments work better for video playback. */
 static const u16 time_steps[FRAMES_PER_SEGMENT] = {
     0, 512, 1023
 };
-
-/* Alpha ramp removed: hard-cut mode, no crossfade */
 
 /* ================================================================
  * SD card weight buffer (in DDR)
