@@ -59,25 +59,25 @@
 /* ================================================================
  * Playback parameters
  * ================================================================ */
-#define FRAMES_PER_SEGMENT  10    /* render 10 frames per segment for crossfade */
-#define TOTAL_SEGMENTS      658   /* ceil(6572 / 10) */
+#define FRAMES_PER_SEGMENT  3     /* 3 frames/segment for ~real-time at 8 FPS */
+#define TOTAL_SEGMENTS      658   /* ceil(6572 / 10) — trained with 10 frames */
 
 /* Time values: sweep [0..1023] mapping to t ∈ [-1.0, +1.0] via RTL.
- * With 10 frames: time_step[fi] = fi * 1023 / 9 (evenly spaced, 0 to 1023).
+ * With 3 frames: sample start, middle, and end of each segment's time range.
  * RTL maps: time_val = time_step * (2/1024) - 1.0 in Q4.28. */
 static const u16 time_steps[FRAMES_PER_SEGMENT] = {
-    0, 114, 227, 341, 455, 568, 682, 796, 909, 1023
+    0, 512, 1023
 };
 
-/* Alpha ramp: 0, 28, 57, 85, 113, 142, 170, 198, 227, 255 */
-static const u8 alpha_ramp[FRAMES_PER_SEGMENT] = {
-    0, 28, 57, 85, 113, 142, 170, 198, 227, 255
-};
+/* Alpha ramp removed: hard-cut mode, no crossfade */
 
 /* ================================================================
  * SD card weight buffer (in DDR)
  * ================================================================ */
 static u32 weight_buf[N_PARAMS];
+
+/* Segment size in bytes */
+#define SEGMENT_BYTES   (N_PARAMS * 4)
 
 /* ================================================================
  * Helper functions
@@ -91,23 +91,21 @@ static void write_weights(u32 bank_base, const u32 *weights, int count)
     }
 }
 
-static int load_segment_from_sd(FIL *fp, const char *filename, u32 *buf)
+static int load_segment(FIL *fp, int seg_num, u32 *buf)
 {
     FRESULT res;
     UINT br;
 
-    res = f_open(fp, filename, FA_READ);
+    res = f_lseek(fp, (FSIZE_t)seg_num * SEGMENT_BYTES);
     if (res != FR_OK) {
-        xil_printf("ERR: open %s failed (%d)\r\n", filename, res);
+        xil_printf("ERR: seek seg %d failed (%d)\r\n", seg_num, res);
         return -1;
     }
 
-    res = f_read(fp, buf, N_PARAMS * 4, &br);
-    f_close(fp);
-
-    if (res != FR_OK || br != N_PARAMS * 4) {
-        xil_printf("ERR: read %s: res=%d br=%u (expected %u)\r\n",
-                    filename, res, br, N_PARAMS * 4);
+    res = f_read(fp, buf, SEGMENT_BYTES, &br);
+    if (res != FR_OK || br != SEGMENT_BYTES) {
+        xil_printf("ERR: read seg %d: res=%d br=%u (expected %u)\r\n",
+                    seg_num, res, br, SEGMENT_BYTES);
         return -1;
     }
 
@@ -143,10 +141,8 @@ int main(void)
     FATFS fs;
     FIL fil;
     FRESULT res;
-    char filename[32];
     int seg;
     int frame;
-    int cur_bank;  /* 0 = next load goes to A, 1 = next load goes to B */
 
     xil_printf("\r\n=== Bad Apple Neural Video Codec ===\r\n");
     xil_printf("SIREN 3->%d->%d->3, %d params, %d segments\r\n",
@@ -161,99 +157,56 @@ int main(void)
     }
     xil_printf("SD card mounted.\r\n");
 
-    /* Enable PS override + threshold mode */
-    Xil_Out32(REG_CTRL, CTRL_PS_OVERRIDE | CTRL_THRESHOLD_EN);
+    /* Open single weights file (all segments concatenated) */
+    res = f_open(&fil, "weights.bin", FA_READ);
+    if (res != FR_OK) {
+        xil_printf("ERR: open weights.bin failed (%d)\r\n", res);
+        xil_printf("Halting.\r\n");
+        while (1) ;
+    }
+    xil_printf("weights.bin opened (%lu bytes).\r\n", f_size(&fil));
+
+    /* Enable PS override (no threshold — show raw grayscale) */
+    Xil_Out32(REG_CTRL, CTRL_PS_OVERRIDE);
 
     /* Wait for any in-progress PL frame to complete, then drain stale frame_done */
     while (Xil_In32(REG_STATUS) & STATUS_FRAME_BUSY)
         ;
     (void)Xil_In32(REG_STATUS);  /* Clear stale frame_done_sticky */
 
-    xil_printf("PS override enabled, threshold ON.\r\n");
+    xil_printf("PS override enabled.\r\n");
 
-    /* Load first two segments into BRAM A and B */
-    xil_printf("Loading seg_000...\r\n");
-    if (load_segment_from_sd(&fil, "seg_000.bin", weight_buf) < 0) {
+    /* Load first segment into BRAM A */
+    xil_printf("Loading segment 0...\r\n");
+    if (load_segment(&fil, 0, weight_buf) < 0) {
         xil_printf("Halting.\r\n");
         while (1) ;
     }
     write_weights(WEIGHT_A_BASE, weight_buf, N_PARAMS);
 
-    xil_printf("Loading seg_001...\r\n");
-    if (load_segment_from_sd(&fil, "seg_001.bin", weight_buf) < 0) {
-        xil_printf("Halting.\r\n");
-        while (1) ;
-    }
-    write_weights(WEIGHT_B_BASE, weight_buf, N_PARAMS);
-
     xil_printf("Starting playback...\r\n");
 
-    /*
-     * Playback loop:
-     *   - Crossfade from current bank A→B over FRAMES_PER_SEGMENT frames
-     *   - Load next segment into the bank that was just faded out (A)
-     *   - Swap: now crossfade B→A
-     *   - Repeat
-     *
-     * Bank tracking:
-     *   cur_bank=0: A has old segment, B has new → alpha ramps 0→255
-     *   cur_bank=1: B has old segment, A has new → alpha ramps 255→0
-     */
-    cur_bank = 0;
-
-    for (seg = 0; seg < TOTAL_SEGMENTS - 1; seg++) {
-        /* Crossfade: render FRAMES_PER_SEGMENT frames */
+    for (seg = 0; seg < TOTAL_SEGMENTS; seg++) {
+        /* Render all frames for this segment using bank A (alpha=0) */
         for (frame = 0; frame < FRAMES_PER_SEGMENT; frame++) {
-            u8 alpha;
-            if (cur_bank == 0) {
-                /* Fading from A (old) to B (new): alpha goes 0→255 */
-                alpha = alpha_ramp[frame];
-            } else {
-                /* Fading from B (old) to A (new): alpha goes 255→0 */
-                alpha = 255 - alpha_ramp[frame];
-            }
-            render_frame(time_steps[frame], alpha);
+            render_frame(time_steps[frame], 0);
         }
 
-        /* Load next segment into the bank that just became "old" */
-        int next_seg = seg + 2;
-        if (next_seg < TOTAL_SEGMENTS) {
-            /* Format seg_NNN.bin without snprintf (standalone BSP may lack it) */
-            filename[0] = 's'; filename[1] = 'e'; filename[2] = 'g'; filename[3] = '_';
-            filename[4] = '0' + (next_seg / 100) % 10;
-            filename[5] = '0' + (next_seg / 10) % 10;
-            filename[6] = '0' + next_seg % 10;
-            filename[7] = '.'; filename[8] = 'b'; filename[9] = 'i'; filename[10] = 'n';
-            filename[11] = '\0';
-
-            if (load_segment_from_sd(&fil, filename, weight_buf) < 0) {
-                xil_printf("Segment %d load failed, looping last.\r\n", next_seg);
+        /* Load next segment into bank A */
+        if (seg + 1 < TOTAL_SEGMENTS) {
+            if (load_segment(&fil, seg + 1, weight_buf) < 0) {
+                xil_printf("Segment %d load failed, stopping.\r\n", seg + 1);
                 break;
             }
-
-            if (cur_bank == 0) {
-                /* A was old, B was new. Load next into A. */
-                write_weights(WEIGHT_A_BASE, weight_buf, N_PARAMS);
-            } else {
-                /* B was old, A was new. Load next into B. */
-                write_weights(WEIGHT_B_BASE, weight_buf, N_PARAMS);
-            }
+            write_weights(WEIGHT_A_BASE, weight_buf, N_PARAMS);
         }
-
-        /* Swap active bank */
-        cur_bank = 1 - cur_bank;
 
         if ((seg & 0x1F) == 0) {
             xil_printf("Seg %d/%d\r\n", seg, TOTAL_SEGMENTS);
         }
     }
 
-    /* Render final segment fully (all frames at alpha=255 or 0) */
-    xil_printf("Final segment, holding...\r\n");
-    for (frame = 0; frame < FRAMES_PER_SEGMENT; frame++) {
-        u8 alpha = (cur_bank == 0) ? 255 : 0;
-        render_frame(time_steps[frame], alpha);
-    }
+    f_close(&fil);
 
     /* Loop forever on last frame */
     xil_printf("Playback complete. Looping.\r\n");

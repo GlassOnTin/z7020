@@ -216,7 +216,7 @@ module mandelbrot_top #(
                 end else begin : gen_mlp
                     mlp_core #(
                         .WIDTH(WIDTH), .FRAC(FRAC), .ITER_W(ITER_W),
-                        .N_HIDDEN(16), .N_LAYERS(3)
+                        .N_HIDDEN(32), .N_LAYERS(3)
                     ) u_mlp (
                         .clk            (clk),
                         .rst_n          (rst_n),

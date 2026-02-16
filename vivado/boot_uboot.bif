@@ -1,0 +1,11 @@
+// boot_uboot.bif — U-Boot UMS boot image using bad_apple_build FSBL/bitstream
+//
+// Same FSBL + bitstream as bad_apple build, but loads U-Boot instead of mlp_loader.
+// U-Boot auto-runs "ums 0 mmc 0" to expose SD card as USB mass storage.
+
+the_ROM_image:
+{
+    [bootloader] bad_apple_build/fsbl/executable.elf
+    bad_apple_build/bad_apple_build.runs/impl_1/system_wrapper.bit
+    ../u-boot/u-boot.elf
+}

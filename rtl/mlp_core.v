@@ -15,9 +15,9 @@
 // A blend pipeline computes w = w_a + ((w_b - w_a) * alpha) >> 8
 // with 1 cycle of pipeline latency, feeding the MAC at 1 weight/cycle.
 //
-// Cycle budget (N_HIDDEN=16, 3→16→16→3):
-//   ~780 cycles/pixel (1 extra cycle per neuron for blend fill)
-//   18 cores × 50 MHz / 780 = ~1.15M pixels/sec → ~21 FPS at 320×172
+// Cycle budget (N_HIDDEN=32, 3→32→32→3):
+//   ~1960 cycles/pixel (1 extra cycle per neuron for blend fill)
+//   18 cores × 50 MHz / 1960 = ~459K pixels/sec → ~8 FPS at 320×172
 
 `timescale 1ns / 1ps
 
@@ -25,7 +25,7 @@ module mlp_core #(
     parameter WIDTH    = 32,
     parameter FRAC     = 28,
     parameter ITER_W   = 16,
-    parameter N_HIDDEN = 16,
+    parameter N_HIDDEN = 32,
     parameter N_LAYERS = 3
 )(
     input  wire                     clk,

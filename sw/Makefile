@@ -24,14 +24,15 @@ LDFLAGS = -mcpu=cortex-a9 -mfpu=vfpv3 -mfloat-abi=hard \
 
 LIBS = -Wl,--start-group -lxilffs -lxil -lgcc -lc -Wl,--end-group
 
-TARGET = mlp_loader.elf
+all: mlp_loader.elf sd_writer.elf
 
-all: $(TARGET)
-
-$(TARGET): mlp_loader.c lscript.ld
+mlp_loader.elf: mlp_loader.c lscript.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ mlp_loader.c $(LIBS)
 
+sd_writer.elf: sd_writer.c lscript.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ sd_writer.c $(LIBS)
+
 clean:
-	rm -f $(TARGET)
+	rm -f mlp_loader.elf sd_writer.elf
 
 .PHONY: all clean
