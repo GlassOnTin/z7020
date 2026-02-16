@@ -39,6 +39,7 @@ scripts/weights.bin
 # Bad Apple data (video frames, eval outputs — too large for git)
 bad_apple/
 !bad_apple/train_h32_colab.ipynb
+!bad_apple/source.mp4
 
 # Board photos and screenshots (not source)
 board_photo*.jpg
