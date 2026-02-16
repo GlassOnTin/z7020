@@ -6,7 +6,9 @@
 
 SIREN (Sinusoidal Representation Networks) use sin() as their activation function instead of ReLU. This produces smooth, continuous output — ideal for representing images, audio, and other signals as implicit functions.
 
-The network takes (x, y, t) as input and produces (R, G, B) as output. Given a trained set of weights, every pixel coordinate maps to a unique color, and the time parameter `t` creates smooth animation. A 387-parameter network generates infinite unique frames from 1.5 KB of weights.
+The network takes (x, y, t) as input and produces (R, G, B) as output. Given a trained set of weights, every pixel coordinate maps to a unique color, and the time parameter `t` creates smooth animation. A 387-parameter network generates frames from 1.5 KB of weights.
+
+For video playback (e.g. Bad Apple), multiple segments are trained — one SIREN per 10-frame segment — and weights are swapped at segment boundaries. 658 segments cover the full 6575-frame video in ~250 KB.
 
 The key insight for FPGA: sin() can be computed with a small lookup table, while ReLU requires comparison logic per neuron. A 256-entry quarter-wave sine table serves all 18 cores.
 
@@ -205,3 +207,21 @@ The MLP core implements the same handshake as `neuron_core`:
 | result_iter | out | 16 | RGB565 color (not iteration count) |
 
 The scheduler, framebuffer, and display pipeline are completely unaware that the core is running a neural network instead of a Mandelbrot iteration.
+
+## FPGA Simulator
+
+`scripts/fpga_sim.py` provides a bit-exact Python implementation of the FPGA's Q4.28 datapath: fixed-point multiply, sine LUT, MLP forward pass, and RGB565 packing. Both scalar and vectorized (numpy) implementations are included, verified to produce identical output.
+
+This enables training-time validation: the FPGA simulator can render a full frame using the same quantized weights and fixed-point arithmetic that the hardware will use, catching float-vs-fixed mismatches before deploying to the board.
+
+## Topology Selection
+
+A sweep across hidden widths (H=8 to H=32) established the trade-offs:
+
+| Hidden | Params | PSNR (float) | PSNR (FPGA) | Est. FPS | Cycles/pixel |
+|--------|--------|-------------|-------------|----------|-------------|
+| 8 | 131 | 17.7 dB | 12.0 dB | ~101 | ~200 |
+| 16 | 387 | 19.6 dB | 14.2 dB | ~41 | ~616 |
+| 32 | 1283 | 21.2 dB | 16.1 dB | ~13 | ~1960 |
+
+H=16 was selected as the target: 3x the throughput of H=32 with only 1.6 dB less PSNR on the FPGA datapath. For Bad Apple's black-and-white content, this is sufficient quality.

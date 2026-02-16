@@ -26,7 +26,43 @@ __pycache__/
 .Xil/
 vivado.jou
 vivado.log
+vivado_*.backup.*
 hailort.log
+
+# Boot images at root (working copies, not source)
+/BOOT.bin
+
+# Generated images and test outputs
+scripts/*_frame*.png
+scripts/weights.bin
+
+# Bad Apple data (video frames, eval outputs — too large for git)
+bad_apple/
+
+# Board photos and screenshots (not source)
+board_photo*.jpg
+screenshot.jpg
+
+# Software build artifacts
+sw/*.elf
+
+# Vivado debug/test scripts (development artifacts)
+vivado/bad_apple_build/
+vivado/BOOT_*.bin
+vivado/BOOT.bin.bak
+vivado/*.elf
+vivado/reginit.int
+vivado/debug_*.tcl
+vivado/test_ddr*.tcl
+vivado/test_ddr*.c
+vivado/read_bootmode.tcl
+vivado/boot_badapple.bif
+vivado/boot_full.bif
+vivado/boot_minimal.bif
+vivado/run_ps_build.tcl
+
+# Z7020 temp directory
+z7020/
 
 # OS files
 .DS_Store

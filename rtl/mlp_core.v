@@ -40,6 +40,12 @@ module mlp_core #(
     input  wire [ITER_W-1:0]        max_iter,   // time parameter
     input  wire [7:0]               alpha,      // morph blend: 0=pattern A, 255=pattern B
 
+    // Weight write port (from PS via AXI): broadcast to all cores
+    input  wire [10:0]             weight_wr_addr,  // 11 bits: covers up to 2048 params
+    input  wire [WIDTH-1:0]        weight_wr_data,
+    input  wire                    weight_wr_en,    // write enable
+    input  wire                    weight_wr_bank,  // 0=BRAM A, 1=BRAM B
+
     output reg                      result_valid,
     output reg  [15:0]              result_pixel_id,
     output reg  [ITER_W-1:0]        result_iter,    // carries RGB565
@@ -68,13 +74,21 @@ module mlp_core #(
 
     `include "mlp_weights.vh"
 
-    // BRAM read ports: 1-cycle latency, same address
+    // BRAM read ports (port A): 1-cycle latency, same address for both banks
     reg  [WADDR_W-1:0] w_addr;
     reg  signed [WIDTH-1:0] w_data, wb_data;
 
     always @(posedge clk) begin
         w_data  <= weight_mem[w_addr];
         wb_data <= weight_b_mem[w_addr];
+    end
+
+    // BRAM write ports (port B): from PS via AXI broadcast
+    always @(posedge clk) begin
+        if (weight_wr_en && !weight_wr_bank)
+            weight_mem[weight_wr_addr[WADDR_W-1:0]]   <= weight_wr_data;
+        if (weight_wr_en && weight_wr_bank)
+            weight_b_mem[weight_wr_addr[WADDR_W-1:0]] <= weight_wr_data;
     end
 
     // =========================================================
@@ -186,8 +200,14 @@ module mlp_core #(
     reg signed [WIDTH-1:0] act_b [0:N_HIDDEN-1];
     reg bank_sel;  // 0: read A, write B. 1: read B, write A.
 
-    // Read from current input bank
-    wire signed [WIDTH-1:0] act_rd = bank_sel ? act_b[cur_k] : act_a[cur_k];
+    // Read from current input bank (delayed cur_k aligns activation with
+    // the blend pipeline: BRAM read + blend each add 1 cycle of latency,
+    // and cur_k increments at the same time as the BRAM address, so the
+    // activation index must be delayed 1 cycle to stay aligned with the
+    // blended weight output.)
+    reg [CNT_W-1:0] cur_k_d;
+    always @(posedge clk) cur_k_d <= cur_k;
+    wire signed [WIDTH-1:0] act_rd = bank_sel ? act_b[cur_k_d] : act_a[cur_k_d];
 
     // =========================================================
     // Single multiplier for MAC
@@ -249,12 +269,15 @@ module mlp_core #(
     assign pixel_ready = (state == S_IDLE);
     assign busy        = (state != S_IDLE);
 
-    // Time: triangle wave (ping-pong) over [0, +8.0) in Q4.28.
-    // max_iter[9:0] gives 0-1023 ramp. Bit 9 selects direction:
-    //   bit 9 = 0: ascending  → time = max_iter[8:0] << 22  (0 → 7.98)
-    //   bit 9 = 1: descending → time = (511 - max_iter[8:0]) << 22  (7.98 → 0)
-    wire [8:0] phase = max_iter[9] ? (9'd511 - max_iter[8:0]) : max_iter[8:0];
-    wire signed [WIDTH-1:0] time_val = {23'b0, phase} << 22;
+    // Time: linear map [0, 1023] → [-1.0, +1.0] in Q4.28.
+    // SIREN networks are trained with t ∈ [-1, +1], so we need:
+    //   time_val = max_iter[9:0] * (2.0/1024) - 1.0
+    // In Q4.28: shift left 19 bits (= multiply by 2^19 ≈ 2^28 * 2/1024),
+    // then subtract 1.0 (= 0x10000000).
+    //   max_iter=0    → 0x00000000 - 0x10000000 = 0xF0000000 = -1.0
+    //   max_iter=512  → 0x10000000 - 0x10000000 = 0x00000000 =  0.0
+    //   max_iter=1023 → 0x1FF80000 - 0x10000000 = 0x0FF80000 = +0.999
+    wire signed [WIDTH-1:0] time_val = $signed({3'b000, max_iter[9:0], 19'b0}) - 32'sh10000000;
 
     // Saturate accumulator to Q4.28
     wire signed [WIDTH-1:0] acc_sat;
@@ -399,8 +422,12 @@ module mlp_core #(
 
                 // -------------------------------------------------
                 S_ACT_WAIT: begin
-                    // sine_lut has 2-cycle latency
-                    if (pipe_cnt == 2'd1) begin
+                    // sine_lut has 2 registered stages. sin_input is set at
+                    // posedge A (S_ACTIVATE). Stage 1 latches at posedge A+1,
+                    // stage 2 latches result at posedge A+2. But since we read
+                    // result as a registered output, we see it at posedge A+3.
+                    // So we need 3 wait cycles (pipe_cnt: 0, 1, 2).
+                    if (pipe_cnt == 2'd2) begin
                         // Store activated value to output bank
                         if (bank_sel)
                             act_a[cur_neuron] <= sin_output;

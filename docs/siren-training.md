@@ -194,6 +194,39 @@ Key constraints:
 - Patterns should vary smoothly in t — abrupt changes won't interpolate well
 - Include enough spatial variation to be visually interesting at 320×172
 
+## Bad Apple Video Training
+
+For video playback, each 10-frame segment gets its own SIREN network. The full Bad Apple video (6575 frames at 320x172) is split into 658 segments, each trained independently.
+
+### Batched GPU training
+
+`scripts/train_colab_batched.py` trains all 658 networks simultaneously using `torch.bmm` — one massive batched matrix multiply per layer instead of 658 sequential tiny ones. This achieves ~100x speedup over sequential training.
+
+```bash
+# On a T4 GPU via Colab (or any CUDA GPU)
+python3 scripts/train_colab_batched.py --epochs 5000 --samples 50000 --mini-batch 10000
+```
+
+Or use the self-contained notebook `scripts/train_h16_colab.ipynb` which handles video upload, frame extraction, training, and weight download.
+
+### Aspect ratio
+
+The display is 320x172 (not square). Training coordinates use:
+- x: [-1, +1]
+- y: [-0.5375, +0.5375] (i.e. ASPECT_Y = 172/320)
+
+This must match the FPGA's coordinate generation in `pixel_scheduler.v`. A mismatch causes spatial distortion.
+
+### FPGA validation
+
+Use `scripts/fpga_sim.py` to validate weights against the FPGA's fixed-point datapath before deploying:
+
+```bash
+python3 scripts/test_mlp_render.py  # Renders frame using fpga_sim Q4.28 pipeline
+```
+
+The float PSNR and FPGA PSNR typically differ by 1-5 dB due to Q4.28 quantization and sine LUT approximation.
+
 ## Deployment Checklist
 
 1. Train: `python3 scripts/train_siren.py --pattern plasma --epochs 10000 --lr 5e-4`

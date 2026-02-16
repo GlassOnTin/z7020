@@ -1554,9 +1554,16 @@ PATTERNS = {
 # Training
 # =========================================================
 def generate_training_data(pattern_fn, n_spatial=64, n_temporal=32):
-    """Generate training samples: (x, y, t) → RGB, all in [-1, +1]."""
+    """Generate training samples: (x, y, t) → RGB.
+
+    x ranges [-1, +1], y ranges [-ASPECT, +ASPECT] where ASPECT = 172/320.
+    This matches the FPGA display: both axes map [-1,+1] to the full display,
+    so the SIREN must be trained on the same rectangular domain to avoid
+    stretching patterns on the 320x172 LCD.
+    """
+    ASPECT = 172.0 / 320.0  # 0.5375 — display height/width
     x = np.linspace(-1, 1, n_spatial)
-    y = np.linspace(-1, 1, n_spatial)
+    y = np.linspace(-ASPECT, ASPECT, n_spatial)
     t = np.linspace(0, 8.0, n_temporal)  # matches FPGA time_val range [0, 8.0)
     xx, yy, tt = np.meshgrid(x, y, t, indexing='ij')
     coords = np.stack([xx.ravel(), yy.ravel(), tt.ravel()], axis=-1)

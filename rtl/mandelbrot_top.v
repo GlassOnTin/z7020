@@ -41,6 +41,22 @@ module mandelbrot_top #(
 
     // UART
     output wire        uart_tx        // 115200 8N1 boot message
+
+`ifdef PS_ENABLE
+    ,
+    // PS control interface (active when ps_override=1)
+    input  wire        ps_override,
+    input  wire [10:0] ext_weight_wr_addr,
+    input  wire [31:0] ext_weight_wr_data,
+    input  wire        ext_weight_wr_en,
+    input  wire        ext_weight_wr_bank,
+    input  wire [7:0]  ext_morph_alpha,
+    input  wire [15:0] ext_time_val,
+    input  wire        ext_frame_start,
+    input  wire        ext_threshold_en,
+    output wire        frame_busy_out,
+    output wire        frame_done_out
+`endif
 );
 
     // =========================================================
@@ -87,20 +103,20 @@ module mandelbrot_top #(
     localparam [ITER_W-1:0]       DEFAULT_MAX_ITER  = 256;
 
     // =========================================================
-    // MLP mode: normalized coordinate viewport [-1, +1]
+    // MLP mode: aspect-corrected coordinate viewport
     // =========================================================
     // x: -1.0 to +1.0 across 320 pixels → step = 2.0/320
-    // y: -1.0 to +1.0 across 172 pixels → step = 2.0/172
-    // Note: display pixels are non-square (1.86:1 aspect ratio).
-    // The SIREN is trained on [-1,+1]² so coordinates match.
+    // y: -0.5375 to +0.5375 across 172 pixels → step = 2.0/320
+    // Both axes use the same step size → square pixels in coordinate
+    // space. SIREN is trained on [-1,+1] × [-0.5375,+0.5375].
     // In Q4.28:
     //   -1.0 = 0xF0000000
+    //   -0.5375 = -172/320 = 0xF7666666
     //   2.0/320 = 0.00625 → 0x0019999A
-    //   2.0/172 = 0.01163 → 0x002FA0BE
     localparam signed [WIDTH-1:0] MLP_CRE_START = 32'shF000_0000;  // -1.0
-    localparam signed [WIDTH-1:0] MLP_CIM_START = 32'shF000_0000;  // -1.0
+    localparam signed [WIDTH-1:0] MLP_CIM_START = 32'shF766_6666;  // -172/320
     localparam signed [WIDTH-1:0] MLP_CRE_STEP  = 32'sh0019_999A;  // 2.0/320
-    localparam signed [WIDTH-1:0] MLP_CIM_STEP  = 32'sh002F_A0BE;  // 2.0/172
+    localparam signed [WIDTH-1:0] MLP_CIM_STEP  = 32'sh0019_999A;  // 2.0/320 (same)
 
     // =========================================================
     // Wires between modules
@@ -147,6 +163,31 @@ module mandelbrot_top #(
     reg [7:0] morph_alpha;
     reg       morph_dir;
 
+    // Weight write port (PS→PL broadcast to all cores)
+    reg [10:0] weight_wr_addr;
+    reg [WIDTH-1:0] weight_wr_data;
+    reg        weight_wr_en;
+    reg        weight_wr_bank;  // 0=BRAM A, 1=BRAM B
+
+`ifdef PS_ENABLE
+    // Expose frame status to PS
+    assign frame_busy_out = frame_busy_w;
+    assign frame_done_out = frame_done_w;
+
+    // PS override mux: select between PL auto-controller and PS-driven values
+    wire [7:0]  active_morph_alpha = ps_override ? ext_morph_alpha : morph_alpha;
+    wire [10:0] active_weight_wr_addr = ps_override ? ext_weight_wr_addr : weight_wr_addr;
+    wire [31:0] active_weight_wr_data = ps_override ? ext_weight_wr_data : weight_wr_data;
+    wire        active_weight_wr_en   = ps_override ? ext_weight_wr_en   : weight_wr_en;
+    wire        active_weight_wr_bank = ps_override ? ext_weight_wr_bank : weight_wr_bank;
+`else
+    wire [7:0]  active_morph_alpha = morph_alpha;
+    wire [10:0] active_weight_wr_addr = weight_wr_addr;
+    wire [31:0] active_weight_wr_data = weight_wr_data;
+    wire        active_weight_wr_en   = weight_wr_en;
+    wire        active_weight_wr_bank = weight_wr_bank;
+`endif
+
     // =========================================================
     // Neuron pool + Pixel scheduler (or test-mode substitute)
     // =========================================================
@@ -185,7 +226,11 @@ module mandelbrot_top #(
                         .c_im           (neuron_c_im_w),
                         .pixel_id       (neuron_pixel_id_w),
                         .max_iter       (max_iter_w),
-                        .alpha          (morph_alpha),
+                        .alpha          (active_morph_alpha),
+                        .weight_wr_addr (active_weight_wr_addr),
+                        .weight_wr_data (active_weight_wr_data),
+                        .weight_wr_en   (active_weight_wr_en),
+                        .weight_wr_bank (active_weight_wr_bank),
                         .result_valid   (result_valid_w[i]),
                         .result_pixel_id(result_pixel_id_w[i*16 +: 16]),
                         .result_iter    (result_iter_w[i*ITER_W +: ITER_W]),
@@ -387,14 +432,24 @@ module mandelbrot_top #(
         (* ram_style = "block" *) reg [15:0] disp_fb_0 [0:FB_DEPTH-1];
         (* ram_style = "block" *) reg [15:0] disp_fb_1 [0:FB_DEPTH-1];
 
+`ifdef PS_ENABLE
+        // Threshold mux: when enabled, convert RGB565 to B/W
+        // R channel is bits [15:11] (5 bits). Threshold at midpoint (>=16).
+        wire threshold_active = ext_threshold_en;
+        wire [15:0] threshold_pixel = (fb_iter_wr_data[15:11] >= 5'd16) ? 16'hFFFF : 16'h0000;
+        wire [15:0] fb_write_data = threshold_active ? threshold_pixel : fb_iter_wr_data;
+`else
+        wire [15:0] fb_write_data = fb_iter_wr_data;
+`endif
+
         // Write: scheduler result → back buffer
         always @(posedge clk) begin
             if (fb_iter_wr_en && !iter_buf_sel)
-                disp_fb_0[fb_iter_wr_addr] <= fb_iter_wr_data;
+                disp_fb_0[fb_iter_wr_addr] <= fb_write_data;
         end
         always @(posedge clk) begin
             if (fb_iter_wr_en && iter_buf_sel)
-                disp_fb_1[fb_iter_wr_addr] <= fb_iter_wr_data;
+                disp_fb_1[fb_iter_wr_addr] <= fb_write_data;
         end
 
         // Read: SPI reads front buffer
@@ -457,6 +512,7 @@ module mandelbrot_top #(
                 iter_buf_sel   <= 0;
                 morph_alpha    <= 0;
                 morph_dir      <= 0;
+                weight_wr_en   <= 0;
             end else begin
                 frame_start_r <= 0;
 
@@ -490,6 +546,11 @@ module mandelbrot_top #(
         // --- MLP time-stepping controller ---
         // Fixed viewport [-1,+1], max_iter increments as time parameter
         // morph_alpha ping-pongs 0→255→0 for weight morphing
+`ifdef PS_ENABLE
+        // PS override: ext_frame_start triggers frames, ext_time_val sets time
+        reg ext_frame_start_prev;
+        wire ext_frame_start_edge = ext_frame_start && !ext_frame_start_prev;
+`endif
         always @(posedge clk or negedge rst_n) begin
             if (!rst_n) begin
                 frame_start_r  <= 0;
@@ -502,9 +563,27 @@ module mandelbrot_top #(
                 iter_buf_sel   <= 0;
                 morph_alpha    <= 0;
                 morph_dir      <= 0;
+                weight_wr_en   <= 0;
+`ifdef PS_ENABLE
+                ext_frame_start_prev <= 0;
+`endif
             end else begin
                 frame_start_r <= 0;
+`ifdef PS_ENABLE
+                ext_frame_start_prev <= ext_frame_start;
 
+                if (ps_override) begin
+                    // PS-driven mode: frame_start from AXI, time from register
+                    max_iter_w <= ext_time_val;
+
+                    if (ext_frame_start_edge && !frame_busy_w) begin
+                        frame_start_r <= 1;
+                    end
+
+                    if (frame_done_w && !frame_busy_w)
+                        iter_buf_sel <= ~iter_buf_sel;
+                end else begin
+`endif
                 if (startup) begin
                     frame_start_r <= 1;
                     startup       <= 0;
@@ -531,6 +610,9 @@ module mandelbrot_top #(
                             morph_alpha <= morph_alpha - 1;
                     end
                 end
+`ifdef PS_ENABLE
+                end  // else (not ps_override)
+`endif
             end
         end
     end endgenerate

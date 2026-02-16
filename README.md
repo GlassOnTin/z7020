@@ -3,7 +3,7 @@
 A reconfigurable parallel compute engine running on a Xilinx Zynq-7020 FPGA, rendering to a 320x172 ST7789V3 LCD over SPI. Eighteen parallel cores share a common scheduler, framebuffer, and display pipeline. The `COMPUTE_MODE` parameter selects what the cores compute:
 
 - **Mode 0 (Mandelbrot):** Each core iterates z = z² + c with 3 pipelined multipliers. Auto-zooms into the seahorse valley.
-- **Mode 1 (MLP/SIREN):** Each core runs a small neural network (3→16→16→3 SIREN) via sequential MAC with BRAM weight storage. Generates animated patterns from trained implicit neural representations.
+- **Mode 1 (MLP/SIREN):** Each core runs a small neural network (3→16→16→3 SIREN) via sequential MAC with BRAM weight storage. Generates animated patterns from trained implicit neural representations — including [Bad Apple](https://en.wikipedia.org/wiki/Bad_Apple!!) video playback from 658 SIREN segments (~250 KB total).
 
 ```
                 ┌─────────────────────────────────────────────┐
@@ -84,15 +84,24 @@ vivado -mode batch -source vivado/run_all.tcl           # Mode 0: Mandelbrot (de
 vivado -mode batch -source vivado/run_all.tcl -tclargs 1  # Mode 1: SIREN neural inference
 ```
 
-### Train custom SIREN weights (Mode 1)
+### Train SIREN weights (Mode 1)
 
+**Procedural patterns:**
 ```bash
-pip install torch numpy
-python3 scripts/train_siren.py --pattern plasma --epochs 3000
+pip install torch numpy pillow
+python3 scripts/train_siren.py --pattern plasma --hidden 16 --epochs 10000 --lr 0.0005
 # Generates rtl/mlp_weights.vh, then rebuild with COMPUTE_MODE=1
 ```
 
-Available patterns: `plasma`, `lava_lamp`, `reaction_diffusion`
+**Bad Apple video (658 segments, GPU recommended):**
+```bash
+# Extract frames from source video
+ffmpeg -i bad_apple/source.mp4 -vf "scale=320:172" bad_apple/frames/frame_%05d.png
+
+# Train all segments (Colab notebook or local GPU)
+# See scripts/train_h16_colab.ipynb for batched GPU training
+# Or: python3 scripts/train_colab_batched.py --epochs 5000
+```
 
 ### Program
 
@@ -101,16 +110,24 @@ Available patterns: `plasma`, `lava_lamp`, `reaction_diffusion`
 vivado -mode batch -source vivado/program.tcl           # Program FPGA
 ```
 
-### Persistent Flash (QSPI/SD Boot)
+### SD Boot with U-Boot UMS
 
-To make the design survive power cycles:
+The board boots from SD card via FSBL → bitstream → U-Boot, then exposes the SD card as a USB mass storage device for easy firmware updates:
 
 ```bash
 vivado -mode batch -source vivado/create_fsbl.tcl       # One-time: generate FSBL
-./vivado/program_qspi.sh                                # Package + flash BOOT.bin
+cd vivado && bootgen -image boot.bif -arch zynq -o BOOT.bin -w
+# Copy BOOT.bin to FAT32 SD card, set boot jumpers to SD, power cycle
 ```
 
-Then set the BOOT jumper to **QSPI** and power-cycle. See [Build & Program](docs/build-and-program.md#qspi-flash-boot-persistent) for details.
+**Deploy cycle** (with U-Boot UMS running):
+```bash
+sudo mount -o uid=1000,gid=1000 /dev/sdd1 /mnt
+cp vivado/BOOT.bin /mnt/ && sync && sudo umount /mnt
+# Power cycle board to boot new firmware
+```
+
+See [Build & Program](docs/build-and-program.md) for QSPI flash and JTAG options.
 
 ## Documentation
 
@@ -124,6 +141,8 @@ Then set the BOOT jumper to **QSPI** and power-cycle. See [Build & Program](docs
 | [Auto-Zoom](docs/auto-zoom.md) | Viewport control, zoom arithmetic, screensaver loop |
 | [Build & Program](docs/build-and-program.md) | Toolchain setup, pin mapping, build flow |
 | [Lessons Learned](docs/lessons-learned.md) | Pitfalls, debugging war stories, Vivado quirks |
+| [SIREN Training](docs/siren-training.md) | Training pipeline, Q4.28 quantization, weight export |
+| [MLP Core](docs/mlp-core.md) | SIREN inference engine: FSM, cycle budget, activation LUT |
 | [The Iteration Thesis](docs/iteration-thesis.md) | From fractal iteration to neural inference — what the architecture actually shares |
 
 ## Project Structure
@@ -141,9 +160,15 @@ z7020/
 │   ├── colormap_lut.v        # Iteration count → RGB565 color palette (Mode 0 only)
 │   └── sp2_spi_driver.v      # ST7789V3 SPI display controller
 ├── scripts/
-│   └── train_siren.py        # PyTorch SIREN training + Q4.28 weight export
+│   ├── train_siren.py        # PyTorch SIREN training + Q4.28 weight export
+│   ├── train_colab_batched.py # Batched training for Bad Apple (all segments on GPU)
+│   ├── train_h16_colab.ipynb  # Self-contained Colab notebook for H=16 training
+│   ├── train_bad_apple.py    # Single-segment Bad Apple training with FPGA validation
+│   ├── fpga_sim.py           # Bit-exact Python simulator of FPGA Q4.28 datapath
+│   └── sweep_topology.py     # Hidden width parameter sweep (H=8..32)
 ├── constraints/
-│   └── z7020_sp.xdc          # Pin assignments and timing constraints
+│   ├── z7020_sp.xdc          # PL pin assignments and timing constraints
+│   └── z7020_sp_ps.xdc       # PS MIO pin assignments (USB0, UART0)
 ├── vivado/
 │   ├── run_all.tcl           # Full build: synth → impl → bitstream (accepts COMPUTE_MODE)
 │   ├── create_project.tcl    # Project creation script
