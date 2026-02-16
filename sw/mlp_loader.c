@@ -19,6 +19,7 @@
 #include "xil_printf.h"
 #include "ff.h"
 #include "sleep.h"
+#include "xtime_l.h"
 #include <string.h>
 
 /* ================================================================
@@ -59,20 +60,40 @@
 /* ================================================================
  * Playback parameters
  * ================================================================ */
-#define FRAMES_PER_SEGMENT  3     /* 3 frames/segment for ~real-time at 8 FPS */
 #define TOTAL_SEGMENTS      658   /* ceil(6572 / 10) — trained with 10 frames */
+#define SOURCE_FPS          30
+#define ORIG_FRAMES_PER_SEG 10    /* source frames each segment covers */
 
-/* Time values: sweep [0..1023] mapping to t ∈ [-1.0, +1.0] via RTL.
- * With 3 frames: sample start, middle, and end of each segment's time range.
- * RTL maps: time_val = time_step * (2/1024) - 1.0 in Q4.28.
+/* PS_CLK crystal frequency — board-specific.
+ * Smart Zynq SP board uses 33.333 MHz (standard Zynq).
+ * NOTE: The BSP's COUNTS_PER_SECOND assumes 50 MHz PS_CLK (650 MHz CPU),
+ * but with 33.333 MHz the actual CPU is 433 MHz — 1.5x slower. We compute
+ * the real global timer rate from SLCR registers at runtime. */
+#define PS_CLK_HZ  33333333U
+
+/* Zynq SLCR register addresses */
+#define ARM_PLL_CTRL  0xF8000100U
+#define ARM_CLK_CTRL  0xF8000120U
+
+static XTime get_timer_freq(void)
+{
+    u32 pll_ctrl = Xil_In32(ARM_PLL_CTRL);
+    u32 clk_ctrl = Xil_In32(ARM_CLK_CTRL);
+    u32 pll_fdiv = (pll_ctrl >> 12) & 0x7F;
+    u32 clk_div  = (clk_ctrl >> 8) & 0x3F;
+
+    /* CPU_6x4x = PS_CLK * PLL_FDIV / CLK_DIVISOR
+     * Global timer = CPU_6x4x / 2 */
+    return (XTime)PS_CLK_HZ * pll_fdiv / clk_div / 2;
+}
+
+/* Time values: [0..1023] maps to t ∈ [-1.0, +1.0] via RTL.
+ * Computed dynamically from position within segment time window.
  *
  * NOTE: Weight morphing (alpha blending between banks) was tried but produces
  * distorted midpoint frames — SIREN weight-space interpolation is non-smooth
  * for independently-trained networks due to sin() activations. Hard cuts
  * between segments work better for video playback. */
-static const u16 time_steps[FRAMES_PER_SEGMENT] = {
-    0, 512, 1023
-};
 
 /* ================================================================
  * SD card weight buffer (in DDR)
@@ -144,8 +165,6 @@ int main(void)
     FATFS fs;
     FIL fil;
     FRESULT res;
-    int seg;
-    int frame;
 
     xil_printf("\r\n=== Bad Apple Neural Video Codec ===\r\n");
     xil_printf("SIREN 3->%d->%d->3, %d params, %d segments\r\n",
@@ -187,32 +206,62 @@ int main(void)
     }
     write_weights(WEIGHT_A_BASE, weight_buf, N_PARAMS);
 
-    xil_printf("Starting playback...\r\n");
+    /* Compute actual global timer rate from SLCR PLL registers */
+    XTime timer_freq = get_timer_freq();
+    XTime seg_ticks = timer_freq * ORIG_FRAMES_PER_SEG / SOURCE_FPS;
+    int seg_ms = (int)(seg_ticks / (timer_freq / 1000));
 
-    for (seg = 0; seg < TOTAL_SEGMENTS; seg++) {
-        /* Render all frames for this segment using bank A (alpha=0) */
-        for (frame = 0; frame < FRAMES_PER_SEGMENT; frame++) {
-            render_frame(time_steps[frame], 0);
-        }
+    xil_printf("Timer: %luHz (BSP: %luHz) segment=%dms\r\n",
+               (u32)timer_freq, (u32)COUNTS_PER_SECOND, seg_ms);
 
-        /* Load next segment into bank A */
-        if (seg + 1 < TOTAL_SEGMENTS) {
-            if (load_segment(&fil, seg + 1, weight_buf) < 0) {
-                xil_printf("Segment %d load failed, stopping.\r\n", seg + 1);
+    /* Global-clock playback: compute which segment should be playing
+     * based on elapsed time and skip ahead when the render can't keep up.
+     * This maintains correct video speed regardless of actual FPS. */
+    XTime playback_start;
+    XTime_GetTime(&playback_start);
+    int prev_seg = 0;
+    int rendered = 0, skipped = 0;
+
+    while (1) {
+        XTime now;
+        XTime_GetTime(&now);
+
+        int cur_seg = (int)((now - playback_start) / seg_ticks);
+        if (cur_seg >= TOTAL_SEGMENTS)
+            break;
+
+        /* Load new segment weights when segment changes */
+        if (cur_seg != prev_seg) {
+            skipped += cur_seg - prev_seg - 1;
+            if (load_segment(&fil, cur_seg, weight_buf) < 0) {
+                xil_printf("Seg %d load failed\r\n", cur_seg);
                 break;
             }
             write_weights(WEIGHT_A_BASE, weight_buf, N_PARAMS);
+            prev_seg = cur_seg;
         }
 
-        if ((seg & 0x1F) == 0) {
-            xil_printf("Seg %d/%d\r\n", seg, TOTAL_SEGMENTS);
-        }
+        /* Compute time_val from position within segment window */
+        XTime seg_origin = playback_start + (XTime)cur_seg * seg_ticks;
+        XTime_GetTime(&now);
+        XTime offset = now - seg_origin;
+        u16 time_val = 512;  /* default: middle */
+        if (offset < seg_ticks)
+            time_val = (u16)(offset * 1023 / seg_ticks);
+
+        render_frame(time_val, 0);
+        rendered++;
+
+        if ((rendered & 0x3F) == 0)
+            xil_printf("Seg %d/%d r=%d s=%d\r\n",
+                       cur_seg, TOTAL_SEGMENTS, rendered, skipped);
     }
 
     f_close(&fil);
 
+    xil_printf("Done. rendered=%d skipped=%d\r\n", rendered, skipped);
+
     /* Loop forever on last frame */
-    xil_printf("Playback complete. Looping.\r\n");
     while (1) {
         usleep(1000000);
     }
